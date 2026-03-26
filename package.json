@@ -1,21 +1,24 @@
 {
   "name": "ai-interview-bot",
   "version": "1.0.0",
-  "description": "AI Interview Bot using Recall.ai + AWS Bedrock + ElevenLabs TTS",
+  "description": "AI Interview Bot using Recall.ai + OpenAI + ElevenLabs TTS",
   "main": "recall-webhook.js",
   "type": "module",
   "scripts": {
     "dev": "npx nodemon recall-webhook.js",
-    "start": "node recall-webhook.js"
+    "start": "node recall-webhook.js",
+    "start:prod": "node start-prod.js"
   },
-  "keywords": ["ai", "interview", "recall.ai", "bedrock", "tts"],
+  "keywords": ["ai", "interview", "recall.ai", "openai", "tts"],
   "author": "Pragmatic Digital",
   "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "@aws-sdk/client-bedrock-runtime": "^3.400.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
-    "ws": "^8.18.0"
+    "node-fetch": "^3.4.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
