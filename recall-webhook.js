@@ -297,7 +297,7 @@ app.post("/webhook/recall/events", async (req, res) => {
       session_key: sessionKey,
       interview_progress: session
         ? {
-            current_question: session.currentQuestion + 1,
+            current_question: session.current_question + 1,
             total_questions: INTERVIEW_CONFIG.questions.length,
             metrics: session.metrics,
           }
