@@ -178,7 +178,8 @@ app.post("/webhook/recall/events", async (req, res) => {
     const sessionKey = `${bot_id}-${call_id}`;
     let session = interviewSessions.get(sessionKey);
 
-    if (!session && event !== "bot.started") {
+    // Only require session to exist for non-initial events
+    if (!session && event !== "bot.in_call_recording") {
       log.warn(`Session not found for ${sessionKey}`);
       return res.status(400).json({ error: "Session not found" });
     }
