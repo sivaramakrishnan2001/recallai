@@ -43,14 +43,28 @@ if (!BEDROCK_API_KEY || !BEDROCK_API_KEY_NAME) {
 
 log.info("AWS Bedrock credentials configured");
 
+// Verify all required configuration at startup
+log.info("=== VERIFYING CONFIGURATION ===");
+log.info(`✅ RECALL_API_KEY: ${RECALL_API_KEY ? "Configured" : "❌ MISSING"}`);
+log.info(`✅ BEDROCK_API_KEY: ${BEDROCK_API_KEY ? "Configured" : "❌ MISSING"}`);
+log.info(`✅ ELEVENLABS_API_KEY: ${process.env.ELEVENLABS_API_KEY ? "Configured" : "❌ MISSING"}`);
+log.info(`✅ ELEVENLABS_VOICE_ID: ${process.env.ELEVENLABS_VOICE_ID || "❌ MISSING"}`);
+log.info(`✅ N8N_WEBHOOK_URL: ${process.env.N8N_WEBHOOK_URL || "Not configured"}`);
+log.info("================================");
+
 // Initialize Bedrock client
 const bedrockClient = new BedrockRuntimeClient({
   region: AWS_REGION,
   credentials: {
-    accessKeyId: BEDROCK_API_KEY_NAME,
-    secretAccessKey: BEDROCK_API_KEY,
+    accessKeyId: BEDROCK_API_KEY_NAME || process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: BEDROCK_API_KEY || process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
+
+// Verify Bedrock is configured
+if (!bedrockClient) {
+  log.error("Failed to initialize Bedrock client - check AWS credentials");
+}
 
 // Store active interview sessions
 const interviewSessions = new Map();
@@ -174,17 +188,25 @@ app.post("/webhook/recall/events", async (req, res) => {
       case "bot.started":
         session = createInterviewSession(bot_id, call_id, data);
         interviewSessions.set(sessionKey, session);
-        log.info(`Interview started: ${sessionKey}`);
+        log.info(`✅ Interview started: ${sessionKey}`);
+        log.info(`Bot ID: ${bot_id}, Call ID: ${call_id}`);
 
         // Greet candidate and ask first question with voice
         setTimeout(async () => {
           const greeting = `Hello! I'm your AI interview assistant. Let's begin with our first question.`;
-          await textToSpeech(greeting, bot_id, call_id);
+          log.info(`🎤 Speaking greeting...`);
+          const greetingResult = await textToSpeech(greeting, bot_id, call_id);
+          if (!greetingResult) {
+            log.error("❌ Failed to generate greeting audio - check ElevenLabs API key");
+          }
 
           setTimeout(async () => {
             const firstQuestion = session.questions[0].text;
-            log.info(`Asking: ${firstQuestion}`);
-            await textToSpeech(firstQuestion, bot_id, call_id);
+            log.info(`🎤 Speaking first question: ${firstQuestion}`);
+            const questionResult = await textToSpeech(firstQuestion, bot_id, call_id);
+            if (!questionResult) {
+              log.error("❌ Failed to generate question audio");
+            }
           }, 2000);
         }, 1000);
         break;
@@ -754,12 +776,17 @@ async function textToSpeech(text, botId, callId) {
   const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
   if (!ELEVENLABS_API_KEY) {
-    log.warn("ElevenLabs API key not configured - skipping TTS");
+    log.error("❌ ElevenLabs API key NOT configured - TTS disabled. Add ELEVENLABS_API_KEY to Render environment variables");
+    return null;
+  }
+
+  if (!ELEVENLABS_VOICE_ID) {
+    log.error("❌ ElevenLabs Voice ID NOT configured - Add ELEVENLABS_VOICE_ID to Render environment variables");
     return null;
   }
 
   try {
-    log.debug(`Converting to speech: "${text.substring(0, 50)}..."`);
+    log.info(`🎵 Converting text to speech (${text.length} chars): "${text.substring(0, 50)}..."`);
 
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
       method: "POST",
@@ -778,19 +805,25 @@ async function textToSpeech(text, botId, callId) {
     });
 
     if (!response.ok) {
-      log.error(`ElevenLabs TTS failed: ${response.status}`);
+      const errorText = await response.text();
+      log.error(`❌ ElevenLabs TTS failed with status ${response.status}: ${errorText}`);
       return null;
     }
 
     const audioBuffer = await response.arrayBuffer();
-    log.debug(`TTS generated ${audioBuffer.byteLength} bytes`);
+    log.info(`✅ TTS generated ${audioBuffer.byteLength} bytes`);
 
     // Send audio to Recall.ai to play in meeting
-    await sendAudioToMeeting(botId, callId, audioBuffer);
+    const sendResult = await sendAudioToMeeting(botId, callId, audioBuffer);
+    if (!sendResult) {
+      log.error("❌ Failed to send audio to Recall.ai");
+      return null;
+    }
 
+    log.info(`✅ Audio sent to meeting successfully`);
     return audioBuffer;
   } catch (error) {
-    log.error(`TTS error: ${error.message}`);
+    log.error(`❌ TTS error: ${error.message}`);
     return null;
   }
 }
@@ -801,13 +834,25 @@ async function textToSpeech(text, botId, callId) {
 async function sendAudioToMeeting(botId, callId, audioBuffer) {
   const RECALL_API_KEY = process.env.RECALL_API_KEY;
 
-  if (!RECALL_API_KEY || !botId) {
-    return;
+  if (!RECALL_API_KEY) {
+    log.error("❌ RECALL_API_KEY not configured - cannot send audio to meeting");
+    return false;
+  }
+
+  if (!botId) {
+    log.error("❌ Bot ID missing - cannot send audio");
+    return false;
+  }
+
+  if (!audioBuffer || audioBuffer.byteLength === 0) {
+    log.error("❌ Audio buffer is empty");
+    return false;
   }
 
   try {
     // Convert buffer to base64 for API
     const base64Audio = Buffer.from(audioBuffer).toString("base64");
+    log.info(`📤 Sending ${audioBuffer.byteLength} bytes to Recall.ai bot ${botId}`);
 
     const response = await fetch(
       `https://ap-northeast-1.recall.ai/api/v1/bot/${botId}/output_audio`,
@@ -826,12 +871,16 @@ async function sendAudioToMeeting(botId, callId, audioBuffer) {
     );
 
     if (response.ok) {
-      log.info("Audio sent to meeting");
+      log.info(`✅ Audio sent to meeting successfully`);
+      return true;
     } else {
-      log.warn(`Failed to send audio: ${response.status}`);
+      const errorText = await response.text();
+      log.error(`❌ Recall.ai API error ${response.status}: ${errorText}`);
+      return false;
     }
   } catch (error) {
-    log.error(`Error sending audio to meeting: ${error.message}`);
+    log.error(`❌ Error sending audio to meeting: ${error.message}`);
+    return false;
   }
 }
 
@@ -855,8 +904,10 @@ function broadcastToMeetingPage(session) {
 // ============================================================================
 
 app.listen(PORT, () => {
-  log.info(`AI Interview Bot started on port ${PORT}`);
-  log.info(`Webhook: http://localhost:${PORT}/webhook/recall/events`);
-  log.info(`Meeting page: http://localhost:${PORT}/meeting-page`);
+  log.info(`\n🚀 AI Interview Bot Server Started\n`);
+  log.info(`Server running on port: ${PORT}`);
+  log.info(`Webhook endpoint: https://your-render-url/webhook/recall/events`);
+  log.info(`Meeting page: https://your-render-url/meeting-page?server=your-render-url`);
+  log.info(`\n✅ Ready to receive Recall.ai webhook events\n`);
   log.info(`TTS: ${process.env.ELEVENLABS_API_KEY ? "Enabled" : "Disabled"}`);
 });
