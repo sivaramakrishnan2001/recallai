@@ -188,36 +188,44 @@ app.post("/webhook/recall/events", async (req, res) => {
     switch (event) {
       // Bot lifecycle events
       case "bot.in_call_recording":
-        log.info(`✅ Bot in call and recording: ${sessionKey}`);
-
-        // Create session only once
         if (!session) {
+          log.info(`\n🎉 Bot in call and recording: ${sessionKey}`);
+
+          // Create new interview session
           session = createInterviewSession(bot_id, call_id, data);
           interviewSessions.set(sessionKey, session);
-          log.info(`✅ Interview session created: ${sessionKey}`);
-          log.info(`Bot ID: ${bot_id}, Call ID: ${call_id}`);
+          log.info(`✅ Session created`);
+          log.info(`   Bot ID: ${bot_id}`);
+          log.info(`   Call ID: ${call_id}`);
+          log.info(`   Interview for position: ${session.position}`);
 
-          // Greet candidate and ask first question with voice
+          // Initialize greeting and first question after a delay
+          // This allows Recall.ai to stabilize the connection
           setTimeout(async () => {
-            const greeting = `Hello! I'm your AI interview assistant. Let's begin with our first question.`;
-            log.info(`🎤 Speaking greeting...`);
-            const greetingResult = await textToSpeech(greeting, bot_id, call_id);
-            if (!greetingResult) {
-              log.error("❌ Failed to generate greeting audio - check ElevenLabs API key");
+            const greeting = `Hello! I'm your AI interview assistant. Today we'll be conducting a ${session.position} interview. Let's begin with our first question.`;
+
+            log.info(`\n🎤 Greeting candidate...`);
+            const greetingSuccess = await textToSpeech(greeting, bot_id, call_id);
+
+            if (greetingSuccess) {
+              log.info(`✅ Greeting sent successfully`);
+            } else {
+              log.error(`⚠️  Greeting failed - but continuing anyway`);
             }
 
+            // Ask first question after greeting finishes
             setTimeout(async () => {
               const currentSession = interviewSessions.get(sessionKey);
-              if (currentSession) {
+              if (currentSession && currentSession.current_question < currentSession.questions.length) {
                 const firstQuestion = currentSession.questions[0].text;
-                log.info(`🎤 Speaking first question: ${firstQuestion}`);
-                const questionResult = await textToSpeech(firstQuestion, bot_id, call_id);
-                if (!questionResult) {
-                  log.error("❌ Failed to generate question audio");
-                }
+                log.info(`\n🎤 Asking first question...`);
+                await textToSpeech(firstQuestion, bot_id, call_id);
+
+                // Broadcast to meeting page
+                broadcastToMeetingPage(currentSession);
               }
-            }, 2000);
-          }, 1000);
+            }, 1500); // Wait for greeting to finish
+          }, 1000); // Initial delay for connection stability
         }
         break;
 
@@ -231,7 +239,7 @@ app.post("/webhook/recall/events", async (req, res) => {
         interviewSessions.delete(sessionKey);
         break;
 
-      // Real-time audio event (NOT "participant.audio")
+      // Real-time audio event (for monitoring)
       case "audio_separate_raw.data":
         log.debug(`🔊 Audio data received`);
         if (session && req.body.data && req.body.data.data) {
@@ -239,12 +247,13 @@ app.post("/webhook/recall/events", async (req, res) => {
           const participant = audioData.participant;
           log.debug(`Audio from participant: ${participant.name || participant.id}`);
 
-          // Process audio buffer (base64 encoded)
-          await processParticipantAudio(session, audioData);
+          // Mark that participant is speaking (for UI feedback)
+          session.isListening = true;
+          session.lastAudioTime = Date.now();
         }
         break;
 
-      // Real-time transcript event (NOT "participant.transcript")
+      // Real-time transcript event (primary processing)
       case "transcript.data":
       case "transcript.partial_data":
         log.debug(`📝 Transcript received: ${event}`);
@@ -259,12 +268,23 @@ app.post("/webhook/recall/events", async (req, res) => {
 
             session.currentTranscript = text;
             session.lastActivity = Date.now();
+            session.isListening = true;
 
-            // Only process finalized transcripts
+            // Only process finalized transcripts to avoid duplicate processing
             if (event === 'transcript.data') {
-              await processParticipantAudio(session, { transcript: text, participant });
+              log.info(`Processing participant response: "${text.substring(0, 100)}..."`);
+              await processParticipantResponse(session, text);
             }
           }
+        }
+        break;
+
+      // Silence detected - candidate stopped speaking
+      case "participant.left":
+      case "participant.speech_final":
+        log.debug(`🎤 Participant finished speaking`);
+        if (session) {
+          session.isListening = false;
         }
         break;
 
@@ -604,116 +624,193 @@ function createInterviewSession(botId, callId, data) {
     },
     responses: [],
     conversation_history: [],
+    // Real-time state tracking
+    isProcessing: false,
+    isListening: false,
+    lastActivity: Date.now(),
+    lastAudioTime: Date.now(),
+    lastProcessedResponse: null,
+    response_count: 0,
   };
 }
 
-async function processParticipantAudio(session, audioData, transcript) {
+/**
+ * Process participant response and generate interviewer follow-up
+ * This is called when we receive a complete transcript.data event
+ */
+async function processParticipantResponse(session, candidateResponse) {
   try {
-    const currentQuestion = session.questions[session.current_question];
-
-    if (!currentQuestion) {
-      console.log("✅ All questions completed");
+    // Prevent duplicate processing
+    if (session.isProcessing || session.lastProcessedResponse === candidateResponse) {
+      log.debug(`Skipping duplicate response processing`);
       return;
     }
 
-    // Add to conversation history
+    session.isProcessing = true;
+    session.lastProcessedResponse = candidateResponse;
+
+    const currentQuestion = session.questions[session.current_question];
+
+    if (!currentQuestion) {
+      log.info(`✅ All questions completed`);
+      return;
+    }
+
+    log.info(`\n📋 Processing response to question ${session.current_question + 1}:`);
+    log.info(`   Q: ${currentQuestion.text.substring(0, 60)}...`);
+    log.info(`   A: ${candidateResponse.substring(0, 80)}...`);
+
+    // Add candidate response to conversation history
     session.conversation_history.push({
       role: "user",
-      content: transcript,
+      content: candidateResponse,
       timestamp: Date.now(),
     });
 
     // Generate interviewer response and metrics using Bedrock
+    log.info(`🧠 Sending to Bedrock for evaluation...`);
     const response = await generateInterviewerResponse(
       session,
       currentQuestion,
-      transcript
+      candidateResponse
     );
 
-    // Update metrics
-    updateMetrics(session, response);
+    if (!response || !response.text) {
+      log.error(`❌ No response from Bedrock`);
+      session.isProcessing = false;
+      return;
+    }
 
-    // Add response to conversation
+    // Update metrics from Bedrock analysis
+    updateMetrics(session, response);
+    log.info(`📊 Metrics updated: Clarity=${session.metrics.clarity}, Depth=${session.metrics.depth}, Communication=${session.metrics.communication}`);
+
+    // Add interviewer response to conversation history
     session.conversation_history.push({
       role: "assistant",
       content: response.text,
       timestamp: Date.now(),
     });
 
-    // Log response
-    log.info(`Bot response: ${response.text.substring(0, 100)}...`);
+    // Broadcast metrics update to meeting page in real-time
+    broadcastToMeetingPage(session);
 
     // Convert bot response to speech and play in meeting
-    await textToSpeech(response.text, session.bot_id, session.call_id);
+    log.info(`🎵 Converting bot response to speech...`);
+    const botSpeechResult = await textToSpeech(response.text, session.bot_id, session.call_id);
 
-    // Move to next question if needed
-    if (response.next_question) {
-      session.current_question++;
-      log.info(`Moving to question ${session.current_question + 1}/${session.questions.length}`);
-
-      // Ask next question after a brief delay
-      setTimeout(async () => {
-        if (session.current_question < session.questions.length) {
-          const nextQuestion = session.questions[session.current_question];
-          log.info(`Asking: ${nextQuestion.text}`);
-
-          // Convert question to speech
-          await textToSpeech(nextQuestion.text, session.bot_id, session.call_id);
-        } else {
-          log.info("All questions completed");
-        }
-      }, 2000);
+    if (!botSpeechResult) {
+      log.error(`❌ Failed to convert bot response to speech`);
+      session.isProcessing = false;
+      return;
     }
 
-    // Broadcast update to meeting page
-    broadcastToMeetingPage(session);
+    // Check if we should move to next question
+    if (response.next_question && session.current_question < session.questions.length - 1) {
+      session.current_question++;
+      log.info(`✅ Moving to question ${session.current_question + 1}/${session.questions.length}`);
+
+      // Ask next question after a brief delay to let audio finish
+      setTimeout(async () => {
+        const nextQuestion = session.questions[session.current_question];
+        if (nextQuestion) {
+          log.info(`\n🎤 Asking next question: ${nextQuestion.text.substring(0, 60)}...`);
+          await textToSpeech(nextQuestion.text, session.bot_id, session.call_id);
+        }
+      }, 2000);
+    } else if (session.current_question >= session.questions.length - 1) {
+      log.info(`✅ All questions completed`);
+    }
+
+    session.isProcessing = false;
+
   } catch (error) {
-    console.error("❌ Error processing audio:", error.message);
+    log.error(`❌ Error processing response: ${error.message}`);
+    session.isProcessing = false;
   }
 }
 
+/**
+ * Generate interviewer response using AWS Bedrock Claude 3 Sonnet
+ * Evaluates candidate response and generates follow-up or next question
+ */
 async function generateInterviewerResponse(session, question, candidateResponse) {
-  const messages = session.conversation_history.map((msg) => ({
-    role: msg.role,
-    content: msg.content,
-  }));
+  try {
+    // Build conversation history for context
+    const messages = session.conversation_history.map((msg) => ({
+      role: msg.role,
+      content: msg.content,
+    }));
 
-  const params = {
-    modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
-    contentType: "application/json",
-    accept: "application/json",
-    body: JSON.stringify({
-      anthropic_version: "bedrock-2023-06-01",
-      max_tokens: 500,
-      system: INTERVIEW_CONFIG.systemPrompt,
-      messages,
-    }),
-  };
+    // Add current candidate response if not already there
+    if (!messages.some(m => m.content === candidateResponse && m.role === "user")) {
+      messages.push({
+        role: "user",
+        content: candidateResponse,
+      });
+    }
 
-  const command = new InvokeModelCommand(params);
-  const response = await bedrockClient.send(command);
-  const responseBody = JSON.parse(new TextDecoder().decode(response.body));
-  const text = responseBody.content?.[0]?.text || "";
+    const params = {
+      modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        anthropic_version: "bedrock-2023-06-01",
+        max_tokens: 500,
+        system: INTERVIEW_CONFIG.systemPrompt,
+        messages,
+      }),
+    };
 
-  // Extract metrics from response
-  const metricsMatch = text.match(
-    /\[METRIC\]\s*clarity:(\d+)\s*depth:(\d+)\s*communication:(\d+)/
-  );
-  const metrics = metricsMatch
-    ? {
-        clarity: parseInt(metricsMatch[1]),
-        depth: parseInt(metricsMatch[2]),
-        communication: parseInt(metricsMatch[3]),
-      }
-    : { clarity: 0, depth: 0, communication: 0 };
+    const command = new InvokeModelCommand(params);
+    log.debug(`Invoking Bedrock model...`);
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+    const text = responseBody.content?.[0]?.text || "";
 
-  return {
-    text,
-    metrics,
-    next_question:
+    if (!text) {
+      log.error(`❌ No response from Bedrock`);
+      return {
+        text: "I see. Thank you for that response. Next question:",
+        metrics: { clarity: 5, depth: 5, communication: 5 },
+        next_question: true,
+      };
+    }
+
+    // Extract metrics from response (looking for [METRIC] format)
+    const metricsMatch = text.match(
+      /\[METRIC\]\s*clarity:(\d+)\s*depth:(\d+)\s*communication:(\d+)/i
+    );
+
+    const metrics = metricsMatch
+      ? {
+          clarity: Math.min(10, Math.max(0, parseInt(metricsMatch[1]))),
+          depth: Math.min(10, Math.max(0, parseInt(metricsMatch[2]))),
+          communication: Math.min(10, Math.max(0, parseInt(metricsMatch[3]))),
+        }
+      : { clarity: 5, depth: 5, communication: 5 }; // Default if not found
+
+    // Determine if next question should be asked
+    const nextQuestion =
       text.toLowerCase().includes("next question") ||
-      text.toLowerCase().includes("thank you"),
-  };
+      text.toLowerCase().includes("moving on") ||
+      text.toLowerCase().includes("thank you") ||
+      session.current_question >= session.questions.length - 1;
+
+    return {
+      text,
+      metrics,
+      next_question: nextQuestion,
+    };
+
+  } catch (error) {
+    log.error(`❌ Bedrock error: ${error.message}`);
+    return {
+      text: "Thank you for that response. Next question:",
+      metrics: { clarity: 5, depth: 5, communication: 5 },
+      next_question: true,
+    };
+  }
 }
 
 function updateMetrics(session, response) {
@@ -803,25 +900,31 @@ async function sendResultsToN8n(results, retries = 3) {
 }
 
 /**
- * Convert text to speech using ElevenLabs API
- * Returns audio buffer that can be sent to meeting
+ * Convert text to speech using ElevenLabs API and send to meeting
+ * Returns boolean indicating success/failure
  */
 async function textToSpeech(text, botId, callId) {
   const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
   const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
   if (!ELEVENLABS_API_KEY) {
-    log.error("❌ ElevenLabs API key NOT configured - TTS disabled. Add ELEVENLABS_API_KEY to Render environment variables");
-    return null;
+    log.error("❌ ElevenLabs API key NOT configured - TTS disabled");
+    return false;
   }
 
   if (!ELEVENLABS_VOICE_ID) {
-    log.error("❌ ElevenLabs Voice ID NOT configured - Add ELEVENLABS_VOICE_ID to Render environment variables");
-    return null;
+    log.error("❌ ElevenLabs Voice ID NOT configured");
+    return false;
+  }
+
+  if (!botId || !callId) {
+    log.error(`❌ Missing bot_id or call_id for TTS`);
+    return false;
   }
 
   try {
-    log.info(`🎵 Converting text to speech (${text.length} chars): "${text.substring(0, 50)}..."`);
+    const textPreview = text.length > 60 ? text.substring(0, 60) + "..." : text;
+    log.debug(`🎵 Converting to speech (${text.length} chars): "${textPreview}"`);
 
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
       method: "POST",
@@ -841,53 +944,62 @@ async function textToSpeech(text, botId, callId) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      log.error(`❌ ElevenLabs TTS failed with status ${response.status}: ${errorText}`);
-      return null;
+      log.error(`❌ ElevenLabs API error ${response.status}: ${errorText}`);
+      return false;
     }
 
     const audioBuffer = await response.arrayBuffer();
-    log.info(`✅ TTS generated ${audioBuffer.byteLength} bytes`);
+    log.debug(`✅ TTS generated ${audioBuffer.byteLength} bytes`);
+
+    if (audioBuffer.byteLength === 0) {
+      log.error(`❌ ElevenLabs returned empty audio buffer`);
+      return false;
+    }
 
     // Send audio to Recall.ai to play in meeting
     const sendResult = await sendAudioToMeeting(botId, callId, audioBuffer);
     if (!sendResult) {
-      log.error("❌ Failed to send audio to Recall.ai");
-      return null;
+      log.error(`❌ Failed to send audio to meeting`);
+      return false;
     }
 
-    log.info(`✅ Audio sent to meeting successfully`);
-    return audioBuffer;
+    log.info(`✅ Audio played in meeting`);
+    return true;
+
   } catch (error) {
     log.error(`❌ TTS error: ${error.message}`);
-    return null;
+    return false;
   }
 }
 
 /**
  * Send audio to Recall.ai bot to play in meeting
+ * Uses the output_audio endpoint to stream audio back to participants
  */
 async function sendAudioToMeeting(botId, callId, audioBuffer) {
   const RECALL_API_KEY = process.env.RECALL_API_KEY;
 
   if (!RECALL_API_KEY) {
-    log.error("❌ RECALL_API_KEY not configured - cannot send audio to meeting");
+    log.error(`❌ RECALL_API_KEY not configured`);
     return false;
   }
 
   if (!botId) {
-    log.error("❌ Bot ID missing - cannot send audio");
+    log.error(`❌ Bot ID is required`);
     return false;
   }
 
   if (!audioBuffer || audioBuffer.byteLength === 0) {
-    log.error("❌ Audio buffer is empty");
+    log.error(`❌ Audio buffer is empty or invalid`);
     return false;
   }
 
   try {
-    // Convert buffer to base64 for API
+    // Convert ArrayBuffer to base64 string
     const base64Audio = Buffer.from(audioBuffer).toString("base64");
-    log.info(`📤 Sending ${audioBuffer.byteLength} bytes to Recall.ai bot ${botId}`);
+    const audioSizeKB = (audioBuffer.byteLength / 1024).toFixed(2);
+
+    log.debug(`📤 Sending audio to Recall.ai (${audioSizeKB} KB, ${audioBuffer.byteLength} bytes)`);
 
     const response = await fetch(
       `https://ap-northeast-1.recall.ai/api/v1/bot/${botId}/output_audio`,
@@ -905,33 +1017,56 @@ async function sendAudioToMeeting(botId, callId, audioBuffer) {
       }
     );
 
-    if (response.ok) {
-      log.info(`✅ Audio sent to meeting successfully`);
+    if (response.ok || response.status === 200 || response.status === 201) {
+      log.debug(`✅ Audio accepted by Recall.ai (${response.status})`);
       return true;
+    } else if (response.status === 404) {
+      // Bot may not exist or already ended call
+      log.warn(`⚠️  Bot not found or call ended (${response.status}) - audio not queued`);
+      return false;
     } else {
       const errorText = await response.text();
-      log.error(`❌ Recall.ai API error ${response.status}: ${errorText}`);
+      log.error(`❌ Recall.ai error (${response.status}): ${errorText}`);
       return false;
     }
   } catch (error) {
-    log.error(`❌ Error sending audio to meeting: ${error.message}`);
+    log.error(`❌ Failed to send audio: ${error.message}`);
     return false;
   }
 }
 
+/**
+ * Broadcast interview updates to all connected meeting pages via WebSocket
+ */
 function broadcastToMeetingPage(session) {
+  if (!wss || !wss.clients) {
+    log.debug(`No WebSocket clients connected`);
+    return;
+  }
+
+  const currentQuestion = session.questions[session.current_question];
+  const messagePayload = {
+    question: currentQuestion?.text || "All questions completed",
+    metrics: session.metrics,
+    progress: `Question ${Math.min(session.current_question + 1, session.questions.length)} of ${session.questions.length}`,
+    timestamp: new Date().toISOString(),
+  };
+
+  let broadcastCount = 0;
   wss.clients.forEach((client) => {
-    if (client.readyState === 1) {
-      // OPEN
-      client.send(
-        JSON.stringify({
-          question: session.questions[session.current_question]?.text,
-          metrics: session.metrics,
-          progress: `Question ${session.current_question + 1} of ${session.questions.length}`,
-        })
-      );
+    if (client && client.readyState === 1) { // WebSocket.OPEN = 1
+      try {
+        client.send(JSON.stringify(messagePayload));
+        broadcastCount++;
+      } catch (error) {
+        log.debug(`Failed to send to WebSocket client: ${error.message}`);
+      }
     }
   });
+
+  if (broadcastCount > 0) {
+    log.debug(`Broadcast to ${broadcastCount} meeting page(s)`);
+  }
 }
 
 // ============================================================================
