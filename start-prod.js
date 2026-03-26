@@ -5,9 +5,10 @@
 
 import { spawn, exec } from "child_process";
 import { promisify } from "util";
-import fetch from "node-fetch";
 import dotenv from "dotenv";
 import fs from "fs";
+
+// Note: fetch is available globally in Node 18+
 
 dotenv.config();
 
