@@ -183,35 +183,45 @@ app.post("/webhook/recall/events", async (req, res) => {
       return res.status(400).json({ error: "Session not found" });
     }
 
-    // Handle different event types
+    // Handle different event types (matching Recall.ai actual events)
     switch (event) {
-      case "bot.started":
-        session = createInterviewSession(bot_id, call_id, data);
-        interviewSessions.set(sessionKey, session);
-        log.info(`✅ Interview started: ${sessionKey}`);
-        log.info(`Bot ID: ${bot_id}, Call ID: ${call_id}`);
+      // Bot lifecycle events
+      case "bot.in_call_recording":
+        log.info(`✅ Bot in call and recording: ${sessionKey}`);
 
-        // Greet candidate and ask first question with voice
-        setTimeout(async () => {
-          const greeting = `Hello! I'm your AI interview assistant. Let's begin with our first question.`;
-          log.info(`🎤 Speaking greeting...`);
-          const greetingResult = await textToSpeech(greeting, bot_id, call_id);
-          if (!greetingResult) {
-            log.error("❌ Failed to generate greeting audio - check ElevenLabs API key");
-          }
+        // Create session only once
+        if (!session) {
+          session = createInterviewSession(bot_id, call_id, data);
+          interviewSessions.set(sessionKey, session);
+          log.info(`✅ Interview session created: ${sessionKey}`);
+          log.info(`Bot ID: ${bot_id}, Call ID: ${call_id}`);
 
+          // Greet candidate and ask first question with voice
           setTimeout(async () => {
-            const firstQuestion = session.questions[0].text;
-            log.info(`🎤 Speaking first question: ${firstQuestion}`);
-            const questionResult = await textToSpeech(firstQuestion, bot_id, call_id);
-            if (!questionResult) {
-              log.error("❌ Failed to generate question audio");
+            const greeting = `Hello! I'm your AI interview assistant. Let's begin with our first question.`;
+            log.info(`🎤 Speaking greeting...`);
+            const greetingResult = await textToSpeech(greeting, bot_id, call_id);
+            if (!greetingResult) {
+              log.error("❌ Failed to generate greeting audio - check ElevenLabs API key");
             }
-          }, 2000);
-        }, 1000);
+
+            setTimeout(async () => {
+              const currentSession = interviewSessions.get(sessionKey);
+              if (currentSession) {
+                const firstQuestion = currentSession.questions[0].text;
+                log.info(`🎤 Speaking first question: ${firstQuestion}`);
+                const questionResult = await textToSpeech(firstQuestion, bot_id, call_id);
+                if (!questionResult) {
+                  log.error("❌ Failed to generate question audio");
+                }
+              }
+            }, 2000);
+          }, 1000);
+        }
         break;
 
-      case "bot.ended":
+      case "bot.call_ended":
+        log.info(`✅ Bot call ended: ${sessionKey}`);
         if (session) {
           const results = finalizeInterview(session);
           log.info(`Interview completed. Final score: ${results.metrics.overall}/100`);
@@ -220,21 +230,45 @@ app.post("/webhook/recall/events", async (req, res) => {
         interviewSessions.delete(sessionKey);
         break;
 
-      case "participant.audio":
-        if (session && audio) {
-          await processParticipantAudio(session, audio, transcript);
+      // Real-time audio event (NOT "participant.audio")
+      case "audio_separate_raw.data":
+        log.debug(`🔊 Audio data received`);
+        if (session && req.body.data && req.body.data.data) {
+          const audioData = req.body.data.data;
+          const participant = audioData.participant;
+          log.debug(`Audio from participant: ${participant.name || participant.id}`);
+
+          // Process audio buffer (base64 encoded)
+          await processParticipantAudio(session, audioData);
         }
         break;
 
-      case "participant.transcript":
-        if (session && transcript) {
-          session.currentTranscript = transcript;
-          session.lastActivity = Date.now();
+      // Real-time transcript event (NOT "participant.transcript")
+      case "transcript.data":
+      case "transcript.partial_data":
+        log.debug(`📝 Transcript received: ${event}`);
+        if (session && req.body.data && req.body.data.data) {
+          const transcriptData = req.body.data.data;
+          const participant = transcriptData.participant;
+
+          // Extract words from transcript
+          if (transcriptData.words && transcriptData.words.length > 0) {
+            const text = transcriptData.words.map(w => w.text).join(' ');
+            log.debug(`${participant.name || 'Participant'}: ${text}`);
+
+            session.currentTranscript = text;
+            session.lastActivity = Date.now();
+
+            // Only process finalized transcripts
+            if (event === 'transcript.data') {
+              await processParticipantAudio(session, { transcript: text, participant });
+            }
+          }
         }
         break;
 
       default:
-        log.debug(`Unknown event: ${event}`);
+        log.debug(`Received event: ${event}`);
     }
 
     res.json({
