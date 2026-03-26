@@ -1,38 +1,53 @@
+// =============================================================================
+// AI Interview Bot — recall-webhook.js
+// Stack: Recall.ai (meeting bot) · OpenAI GPT-4o-mini · ElevenLabs TTS · n8n
+// =============================================================================
+
 import express from "express";
 import { createServer } from "http";
 import dotenv from "dotenv";
+
 dotenv.config();
 
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
+const PORT             = process.env.PORT             || 3000;
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL     = "gpt-4o-mini";               // swap to "gpt-4o" if needed
+const ELEVENLABS_KEY   = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+const N8N_WEBHOOK_URL  = process.env.N8N_WEBHOOK_URL;
+
+const SESSION_TTL_MS   = 3 * 60 * 60 * 1000;         // 3 hours
+const SESSION_GC_MS    = 30 * 60 * 1000;              // cleanup every 30 min
+const TOTAL_QUESTIONS  = 2;
+
+// Simple logger
 const log = {
-  info:  (m) => console.log(`[INFO]  ${m}`),
-  warn:  (m) => console.warn(`[WARN]  ${m}`),
-  error: (m) => console.error(`[ERROR] ${m}`),
+  info:  (msg) => console.log(`[INFO]  ${msg}`),
+  warn:  (msg) => console.warn(`[WARN]  ${msg}`),
+  error: (msg) => console.error(`[ERROR] ${msg}`),
 };
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const PORT               = process.env.PORT               || 3000;
-const AWS_REGION         = process.env.AWS_REGION         || "us-east-1";
-const BEDROCK_API_KEY    = process.env.BEDROCK_API_KEY;          // ABSK... key
-const BEDROCK_KEY_NAME   = process.env.BEDROCK_API_KEY_NAME;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE   = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
-const MODEL_ID           = "anthropic.claude-3-sonnet-20240229-v1:0";
-
-log.info("=== STARTUP CHECKS ===");
-log.info(`BEDROCK_API_KEY    : ${BEDROCK_API_KEY    ? "✅" : "❌ MISSING"}`);
-log.info(`ELEVENLABS_API_KEY : ${ELEVENLABS_API_KEY ? "✅" : "❌ MISSING"}`);
-log.info(`AWS_REGION         : ${AWS_REGION}`);
+log.info("=== Startup Checks ===");
+log.info(`OPENAI_API_KEY   : ${OPENAI_API_KEY ? "✅" : "❌ MISSING"}`);
+log.info(`ELEVENLABS_KEY   : ${ELEVENLABS_KEY ? "✅" : "❌ MISSING"}`);
+log.info(`N8N_WEBHOOK_URL  : ${N8N_WEBHOOK_URL ? "✅" : "⚠️  not set"}`);
 log.info("======================");
 
-// ── Session store ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Session Store
+// -----------------------------------------------------------------------------
 const sessions = new Map();
 
 function createSession(id, role) {
-  const s = {
-    id, role,
+  const session = {
+    id,
+    role,
     questions:     [],
     currentQ:      0,
-    history:       [],
+    history:       [],          // { role: "user"|"assistant", content: string }[]
     metrics:       { clarity: 0, depth: 0, communication: 0, overall: 0 },
     responseCount: 0,
     processing:    false,
@@ -40,53 +55,75 @@ function createSession(id, role) {
     startTime:     Date.now(),
     done:          false,
   };
-  sessions.set(id, s);
-  log.info(`✅ Session [${id}] role="${role}"`);
-  return s;
+  sessions.set(id, session);
+  log.info(`✅ Session created [${id}] role="${role}"`);
+  return session;
 }
 
+// Remove sessions older than SESSION_TTL_MS
 setInterval(() => {
-  const cut = Date.now() - 3 * 3600_000;
-  for (const [k, s] of sessions) if (s.startTime < cut) sessions.delete(k);
-}, 30 * 60_000);
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [id, session] of sessions) {
+    if (session.startTime < cutoff) sessions.delete(id);
+  }
+}, SESSION_GC_MS);
 
-// ── Express + HTTP server ─────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Express Setup
+// -----------------------------------------------------------------------------
 const app    = express();
 const server = createServer(app);
+
 app.use(express.json({ limit: "10mb" }));
-app.use((_, res, next) => {
+
+// Allow requests from any origin (needed for Recall.ai headless browser)
+app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   next();
 });
-app.options("*", (_, res) => res.sendStatus(204));
+app.options("*", (req, res) => res.sendStatus(204));
 
-app.get("/health", (_, res) => res.json({ ok: true, sessions: sessions.size }));
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ ok: true, sessions: sessions.size });
+});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/start  — called once by meeting page on connect
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// POST /api/start
+// Called once by the meeting page when it first connects.
+// Generates 2 interview questions and returns a greeting with TTS audio.
+// -----------------------------------------------------------------------------
 app.post("/api/start", async (req, res) => {
   const { sessionId, role = "Software Engineer" } = req.body || {};
-  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
 
-  let s = sessions.get(sessionId) || createSession(sessionId, role);
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+
+  const session = sessions.get(sessionId) || createSession(sessionId, role);
 
   try {
-    // Generate 2 role-specific questions
-    if (s.questions.length === 0) {
-      log.info(`🧠 Generating questions for: ${role}`);
-      s.questions = await generateQuestions(role);
+    // Generate questions only once per session
+    if (session.questions.length === 0) {
+      log.info(`🧠 Generating questions for role: ${role}`);
+      session.questions = await generateQuestions(role);
     }
 
     const greeting =
       `Hi! I'm your AI interviewer today for the ${role} position. ` +
       `I have just two questions for you — take your time and answer naturally. ` +
-      `Here's the first one: ${s.questions[0]}`;
+      `Here's the first one: ${session.questions[0]}`;
 
-    const audio = await tts(greeting);
-    return res.json({ audio, greeting, questions: s.questions, totalQuestions: s.questions.length });
+    const audio = await textToSpeech(greeting);
+
+    return res.json({
+      audio,
+      greeting,
+      questions:      session.questions,
+      totalQuestions: session.questions.length,
+    });
 
   } catch (err) {
     log.error(`/api/start: ${err.message}`);
@@ -94,610 +131,840 @@ app.post("/api/start", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/respond  — called every time candidate finishes a sentence
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// POST /api/respond
+// Called whenever the candidate finishes speaking (after a silence gap).
+// Evaluates the answer, updates metrics, and returns the next response.
+// -----------------------------------------------------------------------------
 app.post("/api/respond", async (req, res) => {
   const { sessionId, text } = req.body || {};
-  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
-  if (!text || text.trim().length < 3) return res.status(400).json({ error: "too short" });
 
-  const s = sessions.get(sessionId);
-  if (!s) return res.status(404).json({ error: "session not found — call /api/start first" });
-  if (s.done)      return res.json({ done: true, metrics: s.metrics });
-  if (s.processing) return res.status(429).json({ error: "busy" });
-  if (text.trim() === s.lastText.trim()) return res.status(429).json({ error: "duplicate" });
+  // --- Input validation ---
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+  if (!text || text.trim().length < 3) {
+    return res.status(400).json({ error: "Answer is too short" });
+  }
 
-  s.processing = true;
-  s.lastText   = text.trim();
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: "Session not found — call /api/start first" });
+  }
+
+  // --- Guard against duplicate / concurrent requests ---
+  if (session.done)       return res.json({ done: true, metrics: session.metrics });
+  if (session.processing) return res.status(429).json({ error: "Still processing previous answer" });
+  if (text.trim() === session.lastText) return res.status(429).json({ error: "Duplicate answer" });
+
+  session.processing = true;
+  session.lastText   = text.trim();
 
   try {
-    const curQ = s.questions[s.currentQ] || "Thank you for your answers.";
-    log.info(`💬 [${sessionId}] Q${s.currentQ + 1}: "${text.substring(0, 80)}"`);
+    const currentQuestion = session.questions[session.currentQ] || "Thank you for your answers.";
+    log.info(`💬 [${sessionId}] Q${session.currentQ + 1}: "${text.substring(0, 80)}"`);
 
-    s.history.push({ role: "user", content: text });
-    const ai = await evaluateAnswer(s, curQ, text);
-    s.history.push({ role: "assistant", content: ai.text });
-    updateMetrics(s, ai.metrics);
+    // Record answer and get AI evaluation
+    session.history.push({ role: "user", content: text });
+    const evaluation = await evaluateAnswer(session, currentQuestion, text);
+    session.history.push({ role: "assistant", content: evaluation.text });
+    updateMetrics(session, evaluation.metrics);
 
-    let spoken    = ai.text;
-    let isDone    = false;
+    // Decide what the bot says next
+    let spokenReply = evaluation.text;
+    let isDone      = false;
 
-    if (ai.next) {
-      if (s.currentQ < s.questions.length - 1) {
-        s.currentQ++;
-        spoken += " " + s.questions[s.currentQ];
-        log.info(`➡️  Q${s.currentQ + 1}`);
+    if (evaluation.readyForNext) {
+      const hasMoreQuestions = session.currentQ < session.questions.length - 1;
+
+      if (hasMoreQuestions) {
+        session.currentQ++;
+        spokenReply += " " + session.questions[session.currentQ];
+        log.info(`➡️  Moving to Q${session.currentQ + 1}`);
       } else {
-        isDone   = true;
-        s.done   = true;
-        spoken  += " That wraps up our interview. Thank you so much — we'll be in touch!";
-        log.info(`🏁 Interview done [${sessionId}]`);
-        sendToN8n(s);
+        isDone       = true;
+        session.done = true;
+        spokenReply += " That wraps up our interview. Thank you so much — we'll be in touch!";
+        log.info(`🏁 Interview complete [${sessionId}]`);
+        sendResultsToN8n(session);
       }
     }
 
-    const audio = await tts(spoken);
-    s.processing = false;
+    const audio = await textToSpeech(spokenReply);
+    session.processing = false;
 
     return res.json({
       audio,
-      text:           spoken,
-      metrics:        s.metrics,
-      questionIndex:  s.currentQ,
-      totalQuestions: s.questions.length,
-      currentQ:       s.questions[s.currentQ] || null,
+      text:           spokenReply,
+      metrics:        session.metrics,
+      questionIndex:  session.currentQ,
+      totalQuestions: session.questions.length,
+      currentQ:       session.questions[session.currentQ] || null,
       done:           isDone,
     });
 
   } catch (err) {
-    s.processing = false;
+    session.processing = false;
     log.error(`/api/respond: ${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ── Recall.ai lifecycle webhook ───────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// POST /webhook/recall/events
+// Recall.ai lifecycle events (bot joined, call ended, etc.)
+// -----------------------------------------------------------------------------
 app.post("/webhook/recall/events", (req, res) => {
-  const e   = req.body?.event;
-  const bid = req.body?.data?.bot?.id;
-  log.info(`📨 ${e} bot=${bid}`);
+  const event = req.body?.event;
+  const botId = req.body?.data?.bot?.id;
+
+  log.info(`📨 Recall event: ${event}  bot=${botId}`);
   res.json({ status: "ok" });
-  if (e === "bot.call_ended" && bid) {
-    const s = sessions.get(bid);
-    if (s && !s.done) { sendToN8n(s); sessions.delete(bid); }
+
+  if (event === "bot.call_ended" && botId) {
+    const session = sessions.get(botId);
+    if (session && !session.done) {
+      sendResultsToN8n(session);
+      sessions.delete(botId);
+    }
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // GET /meeting-page?server=DOMAIN&role=ROLE
-// ─────────────────────────────────────────────────────────────────────────────
+// Serves the HTML UI that runs inside Recall.ai's headless browser.
+// Connects to Recall.ai's transcript WebSocket and drives the interview.
+// -----------------------------------------------------------------------------
 app.get("/meeting-page", (req, res) => {
   const serverUrl = req.query.server
     ? `https://${req.query.server}`
     : `http://localhost:${PORT}`;
-  const role = req.query.role ? decodeURIComponent(req.query.role) : "Software Engineer";
 
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>AI Interview Bot</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-  background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);
-  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-.card{background:#fff;border-radius:24px;padding:32px 36px;width:100%;max-width:760px;
-  box-shadow:0 32px 80px rgba(0,0,0,.6)}
-h1{text-align:center;font-size:22px;color:#1a1a2e;margin-bottom:2px}
-.sub{text-align:center;font-size:11px;color:#999;margin-bottom:8px}
-.badge{display:block;width:fit-content;margin:0 auto 22px;background:#ede7f6;
-  color:#512da8;font-size:12px;font-weight:700;padding:4px 16px;border-radius:20px}
+  const role = req.query.role
+    ? decodeURIComponent(req.query.role)
+    : "Software Engineer";
 
-/* status */
-.st{padding:11px 18px;border-radius:10px;text-align:center;font-weight:600;
-  font-size:14px;margin-bottom:18px;transition:background .3s,color .3s}
-.st.idle      {background:#f5f5f5;color:#888}
-.st.listening {background:#e8f5e9;color:#2e7d32}
-.st.thinking  {background:#fff8e1;color:#e65100}
-.st.speaking  {background:#e3f2fd;color:#1565c0}
-.st.done      {background:#f3e5f5;color:#6a1b9a}
+  const html = buildMeetingPageHTML(serverUrl, role);
 
-/* waveform */
-.wave{display:flex;align-items:center;justify-content:center;gap:4px;height:42px;margin:12px 0}
-.bar{width:5px;border-radius:3px;background:linear-gradient(180deg,#7c3aed,#2563eb);
-  transition:height .15s}
-.wave.active .bar{animation:pulse .5s ease-in-out infinite}
-.bar:nth-child(1){height:8px;animation-delay:0s}
-.bar:nth-child(2){height:16px;animation-delay:.08s}
-.bar:nth-child(3){height:28px;animation-delay:.16s}
-.bar:nth-child(4){height:36px;animation-delay:.24s}
-.bar:nth-child(5){height:28px;animation-delay:.32s}
-.bar:nth-child(6){height:16px;animation-delay:.40s}
-.bar:nth-child(7){height:8px;animation-delay:.48s}
-@keyframes pulse{0%,100%{transform:scaleY(.6)}50%{transform:scaleY(1.4)}}
-
-/* metrics */
-.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
-.m{background:#fafafe;border:1px solid #e8eaf6;border-radius:12px;padding:14px;text-align:center}
-.m label{display:block;font-size:10px;color:#9fa8da;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
-.m .v{font-size:28px;font-weight:800;color:#5c35c8}
-.overall{text-align:center;font-size:12px;color:#999;margin-bottom:18px}
-.overall b{color:#5c35c8;font-size:14px}
-
-/* question */
-.qbox{border-left:4px solid #7c3aed;background:#f9f9ff;padding:15px 18px;
-  border-radius:0 12px 12px 0;margin-bottom:14px;min-height:64px}
-.qlabel{font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
-.qtext{color:#1a1a2e;font-size:14px;line-height:1.6;font-weight:500}
-
-/* transcript */
-.tbox{background:#fafafa;border-radius:10px;padding:10px 14px;margin-bottom:12px;min-height:36px}
-.tlabel{font-size:10px;color:#bbb;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
-.ttext{font-size:13px;color:#666;font-style:italic;line-height:1.5}
-
-/* progress */
-.prog-wrap{margin-bottom:6px}
-.prog-bar{height:5px;background:#eee;border-radius:3px;overflow:hidden;margin-bottom:5px}
-.prog-fill{height:100%;background:linear-gradient(90deg,#7c3aed,#2563eb);border-radius:3px;
-  transition:width .5s;width:0%}
-.prog-label{text-align:center;font-size:11px;color:#bbb}
-
-#log{font-size:10px;color:#ccc;text-align:center;margin-top:8px;min-height:14px}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>🎤 AI Interview Bot</h1>
-  <p class="sub">Powered by AWS Bedrock · ElevenLabs Voice</p>
-  <span class="badge" id="badge">Position: ${role}</span>
-
-  <div class="st idle" id="st">⏳ Connecting to meeting...</div>
-
-  <div class="wave" id="wave">
-    <div class="bar"></div><div class="bar"></div><div class="bar"></div>
-    <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
-  </div>
-
-  <div class="metrics">
-    <div class="m"><label>Clarity</label><div class="v" id="mc">--</div></div>
-    <div class="m"><label>Tech Depth</label><div class="v" id="md">--</div></div>
-    <div class="m"><label>Communication</label><div class="v" id="mm">--</div></div>
-  </div>
-  <div class="overall">Overall: <b id="mo">--</b>/100</div>
-
-  <div class="qbox">
-    <div class="qlabel">Current Question</div>
-    <div class="qtext" id="qt">Initializing...</div>
-  </div>
-
-  <div class="tbox">
-    <div class="tlabel">Candidate is saying...</div>
-    <div class="ttext" id="tt">(listening)</div>
-  </div>
-
-  <div class="prog-wrap">
-    <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
-    <div class="prog-label" id="pl">Starting up...</div>
-  </div>
-  <div id="log"></div>
-</div>
-<audio id="audio" autoplay playsinline style="display:none"></audio>
-
-<script>
-const SERVER     = '${serverUrl}';
-const ROLE       = '${role}';
-const SID        = 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2,7);
-
-const $ = id => document.getElementById(id);
-let questions    = [];
-let qIdx         = 0;
-let totalQ       = 2;
-let done         = false;
-let playing      = false;
-let thinking     = false;
-const queue      = [];
-let accumulated  = '';
-let silTimer     = null;
-let lastSent     = '';
-const SILENCE    = 1800;   // ms of silence before processing
-
-function dbg(m){ $('log').textContent = m; console.log('[BOT]', m); }
-
-function status(type, msg){
-  const el = $('st');
-  el.className = 'st ' + type;
-  el.textContent = msg;
-  $('wave').className = 'wave' + (type === 'speaking' ? ' active' : '');
-}
-
-function setMetrics(m){
-  if(!m) return;
-  $('mc').textContent = m.clarity       ?? '--';
-  $('md').textContent = m.depth         ?? '--';
-  $('mm').textContent = m.communication ?? '--';
-  $('mo').textContent = m.overall       ?? '--';
-}
-
-function setProgress(idx, total){
-  $('pf').style.width = ((idx+1)/total*100) + '%';
-  $('pl').textContent = 'Question ' + (idx+1) + ' of ' + total;
-}
-
-// ── Audio queue ────────────────────────────────────────────────────────────
-function enqueue(b64, txt){
-  if(!b64) return;
-  queue.push({ b64, txt });
-  playNext();
-}
-
-function playNext(){
-  if(playing || queue.length === 0) return;
-  playing = true;
-  const { b64, txt } = queue.shift();
-  dbg('🔊 ' + txt.substring(0,70));
-  status('speaking','🗣️ Speaking...');
-
-  try {
-    const raw = atob(b64);
-    const buf = new Uint8Array(raw.length);
-    for(let i=0;i<raw.length;i++) buf[i]=raw.charCodeAt(i);
-    const url = URL.createObjectURL(new Blob([buf],{type:'audio/mpeg'}));
-    const a   = $('audio');
-    a.src = url;
-    a.onended  = ()=>{ URL.revokeObjectURL(url); playing=false; status('listening','👂 Listening...'); playNext(); };
-    a.onerror  = ()=>{ playing=false; playNext(); };
-    a.play().catch(e=>{ dbg('play() '+e.message); playing=false; playNext(); });
-  } catch(e){ dbg('audio error: '+e.message); playing=false; playNext(); }
-}
-
-// ── API ────────────────────────────────────────────────────────────────────
-async function apiStart(){
-  dbg('Starting session...');
-  status('thinking','🧠 Generating questions for '+ROLE+'...');
-  try{
-    const r = await fetch(SERVER+'/api/start',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sessionId:SID, role:ROLE })
-    });
-    if(!r.ok) throw new Error('HTTP '+r.status+': '+await r.text());
-    const d = await r.json();
-    questions = d.questions || [];
-    totalQ    = d.totalQuestions || 2;
-    $('qt').textContent = questions[0] || 'Interview starting...';
-    setProgress(0, totalQ);
-    dbg('✅ Started. Playing greeting...');
-    enqueue(d.audio, d.greeting||'');
-  } catch(e){
-    dbg('start error: '+e.message);
-    status('idle','❌ Start failed: '+e.message.substring(0,60));
-  }
-}
-
-async function apiRespond(text){
-  if(done||thinking) return;
-  const t = text.trim();
-  if(t.length < 4 || t === lastSent) return;
-  lastSent  = t;
-  thinking  = true;
-  $('tt').textContent = '(processing your answer...)';
-  status('thinking','🧠 Thinking...');
-  try{
-    const r = await fetch(SERVER+'/api/respond',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sessionId:SID, text:t })
-    });
-    thinking = false;
-    if(r.status === 429){ return; }
-    if(!r.ok){ const err=await r.text(); throw new Error('HTTP '+r.status+': '+err); }
-    const d = await r.json();
-    setMetrics(d.metrics);
-    qIdx = d.questionIndex ?? qIdx;
-    setProgress(qIdx, d.totalQuestions ?? totalQ);
-    if(d.currentQ) $('qt').textContent = d.currentQ;
-    if(d.done){
-      done = true;
-      $('qt').textContent = '✅ Interview complete — thank you!';
-      status('done','✅ All done!');
-    }
-    enqueue(d.audio, d.text||'');
-  } catch(e){
-    thinking = false;
-    dbg('respond error: '+e.message.substring(0,80));
-    status('listening','👂 Listening...');
-  }
-}
-
-// ── Recall.ai transcript WebSocket ─────────────────────────────────────────
-// Runs inside Recall.ai's headless browser.
-// Connects to Recall.ai's built-in transcript feed — no auth needed.
-let ws, retries = 0;
-
-function connect(){
-  dbg('Connecting to transcript feed...');
-  try {
-    ws = new WebSocket('wss://meeting-data.bot.recall.ai/api/v1/transcript');
-  } catch(e){
-    dbg('WS init: '+e.message);
-    setTimeout(connect, 4000);
-    return;
-  }
-
-  ws.onopen = () => {
-    retries = 0;
-    dbg('✅ Transcript feed connected');
-    status('listening','👂 Connected — starting interview...');
-    apiStart();
-  };
-
-  ws.onmessage = (e) => {
-    // While bot is speaking or thinking, ignore incoming transcript to avoid
-    // bot hearing its own voice or interrupting itself
-    if(playing || thinking || done) return;
-
-    let d;
-    try { d = JSON.parse(e.data); } catch { return; }
-
-    // Recall.ai transcript format: { transcript: { words: [{text},...] } }
-    const words = d?.transcript?.words || d?.words || [];
-    if(!words.length) return;
-
-    const chunk = words.map(w => w.text||w.word||'').join(' ').trim();
-    if(!chunk) return;
-
-    // Accumulate words
-    accumulated = accumulated ? accumulated + ' ' + chunk : chunk;
-    $('tt').textContent = accumulated;
-
-    // After SILENCE ms of no new words, process the full accumulated text
-    clearTimeout(silTimer);
-    silTimer = setTimeout(() => {
-      const final = accumulated.trim();
-      accumulated = '';
-      $('tt').textContent = '(listening)';
-      if(final.length > 4) {
-        dbg('📝 Got: '+final.substring(0,80));
-        apiRespond(final);
-      }
-    }, SILENCE);
-  };
-
-  ws.onerror = e => dbg('WS err: '+(e.message||'?'));
-
-  ws.onclose = () => {
-    if(done) return;
-    const delay = Math.min(2000 * (++retries), 15000);
-    dbg('WS closed — retry in '+(delay/1000)+'s');
-    status('idle','⏳ Reconnecting...');
-    setTimeout(connect, delay);
-  };
-}
-
-connect();
-</script>
-</body>
-</html>`;
-
+  // Allow this page to be embedded in Teams / iframes
   res.removeHeader("X-Frame-Options");
   res.setHeader("X-Frame-Options", "ALLOWALL");
   res.type("text/html").send(html);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AI: Generate 2 role-specific questions
-// Uses direct HTTP to Bedrock with ABSK Bearer token (NOT AWS SDK)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AI: Generate 2 role-specific interview questions
+// -----------------------------------------------------------------------------
 async function generateQuestions(role) {
-  const prompt = `Generate exactly 2 interview questions for a ${role} position.
-Return ONLY a valid JSON array of 2 strings. No explanation, no numbering.
-Example: ["First question?","Second question?"]
-Make questions open-ended, covering experience and a technical/problem-solving scenario.`;
+  const prompt = `
+Generate exactly 2 interview questions for a ${role} position.
+Return ONLY a valid JSON array of 2 strings — no explanation, no numbering.
+Example: ["First question?", "Second question?"]
+One question should be about past experience, the other about a technical or problem-solving scenario.
+  `.trim();
 
   try {
-    const result = await callClaude([{ role: "user", content: prompt }], null, 400);
-    const text = result?.content?.[0]?.text || "";
-    const match = text.match(/\[[\s\S]*?\]/);
-    if (match) {
-      const arr = JSON.parse(match[0]);
-      if (Array.isArray(arr) && arr.length >= 2) return arr.slice(0, 2);
+    const responseText = await callOpenAI(
+      [{ role: "user", content: prompt }],
+      null,
+      400
+    );
+
+    const jsonMatch = responseText.match(/\[[\s\S]*?\]/);
+    if (jsonMatch) {
+      const questions = JSON.parse(jsonMatch[0]);
+      if (Array.isArray(questions) && questions.length >= 2) {
+        log.info(`✅ Generated ${questions.length} questions for: ${role}`);
+        return questions.slice(0, TOTAL_QUESTIONS);
+      }
     }
-  } catch (e) {
-    log.error(`generateQuestions: ${e.message}`);
+  } catch (err) {
+    log.error(`generateQuestions: ${err.message}`);
   }
 
-  // Fallback
+  // Fallback questions — used if AI call fails
+  log.warn("Using fallback questions");
   return [
-    `Tell me about your experience as a ${role} — what are you most proud of?`,
-    `Describe a difficult technical problem you solved and how you approached it.`,
+    `Tell me about your experience as a ${role} — what project are you most proud of and why?`,
+    `Describe a difficult technical problem you faced and how you solved it.`,
   ];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AI: Evaluate candidate answer + decide if next question
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AI: Evaluate a candidate's answer and return a response + scores
+// -----------------------------------------------------------------------------
 async function evaluateAnswer(session, question, answer) {
-  const system = `You are a friendly interviewer for a ${session.role} position.
+  const systemPrompt = `
+You are a warm, professional interviewer for a ${session.role} position.
 The current question was: "${question}"
-The candidate just answered. Respond naturally in 1-2 sentences max.
-Acknowledge what they said, then EITHER ask a brief follow-up OR say you're ready to move on.
+The candidate just answered. Respond in 1-2 sentences only.
+Briefly acknowledge what they said and transition naturally.
+Do NOT repeat the next question — the system will append it automatically.
 
 End your response with EXACTLY this tag on its own line:
 [SCORE] clarity:N depth:N comm:N next:yes
-Where N = 1-10. Use next:yes when satisfied with the answer and ready to move on.`;
+Where N is 1–10. Use next:yes when satisfied and ready to move on.
+  `.trim();
 
   try {
-    const messages = session.history.map(m => ({ role: m.role, content: m.content }));
-    const result = await callClaude(messages, system, 250);
-    const full = result?.content?.[0]?.text || "";
+    const messages = session.history.map(({ role, content }) => ({ role, content }));
+    const fullResponse = await callOpenAI(messages, systemPrompt, 250);
 
-    const m = full.match(/\[SCORE\]\s*clarity:(\d+)\s*depth:(\d+)\s*comm:(\d+)\s*next:(yes|no)/i);
-    const metrics = m
-      ? { clarity: +m[1], depth: +m[2], communication: +m[3] }
+    const scoreMatch = fullResponse.match(
+      /\[SCORE\]\s*clarity:(\d+)\s*depth:(\d+)\s*comm:(\d+)\s*next:(yes|no)/i
+    );
+
+    const metrics = scoreMatch
+      ? { clarity: +scoreMatch[1], depth: +scoreMatch[2], communication: +scoreMatch[3] }
       : { clarity: 6, depth: 6, communication: 6 };
-    const next = m ? m[4].toLowerCase() === "yes" : true;
-    const text = full.replace(/\[SCORE\].*$/im, "").trim() || "Thank you for that. Let's continue.";
 
-    return { text, metrics, next };
-  } catch (e) {
-    log.error(`evaluateAnswer: ${e.message}`);
+    const readyForNext = scoreMatch ? scoreMatch[4].toLowerCase() === "yes" : true;
+    const text = fullResponse.replace(/\[SCORE\].*$/im, "").trim()
+      || "Thank you for that. Let's continue.";
+
+    return { text, metrics, readyForNext };
+
+  } catch (err) {
+    log.error(`evaluateAnswer: ${err.message}`);
     return {
-      text: "Thank you for sharing that.",
-      metrics: { clarity: 6, depth: 6, communication: 6 },
-      next: true,
+      text:         "Thank you for sharing that.",
+      metrics:      { clarity: 6, depth: 6, communication: 6 },
+      readyForNext: true,
     };
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Claude via direct HTTP — works with ABSK Bedrock API keys (Bearer token)
-// Also decodes ABSK → accessKeyId:secretKey for fallback IAM signing
-// ─────────────────────────────────────────────────────────────────────────────
-async function callClaude(messages, system, maxTokens = 300) {
-  if (!BEDROCK_API_KEY) throw new Error("BEDROCK_API_KEY not configured");
+// -----------------------------------------------------------------------------
+// OpenAI: Chat completion — returns the assistant's reply as a string
+// -----------------------------------------------------------------------------
+async function callOpenAI(messages, systemPrompt, maxTokens = 300) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
 
-  const url  = `https://bedrock-runtime.${AWS_REGION}.amazonaws.com/model/${MODEL_ID}/invoke`;
-  const body = JSON.stringify({
-    anthropic_version: "bedrock-2023-06-01",
-    max_tokens:        maxTokens,
-    ...(system ? { system } : {}),
-    messages,
+  const payload = {
+    model:      OPENAI_MODEL,
+    max_tokens: maxTokens,
+    messages:   systemPrompt
+      ? [{ role: "system", content: systemPrompt }, ...messages]
+      : messages,
+  };
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method:  "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
   });
 
-  // ── Attempt 1: ABSK Bearer token (new Bedrock API key format) ────────────
-  try {
-    const res = await fetch(url, {
-      method:  "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-        "Authorization": `Bearer ${BEDROCK_API_KEY}`,
-      },
-      body,
-    });
-
-    if (res.ok) {
-      const json = await res.json();
-      log.info(`✅ Bedrock OK (Bearer)`);
-      return json;
-    }
-
-    const errText = await res.text();
-    log.warn(`Bearer attempt failed (${res.status}): ${errText.substring(0, 120)}`);
-
-    // If it's a 403 auth error, try decode
-    if (res.status !== 403 && res.status !== 401) {
-      throw new Error(`Bedrock ${res.status}: ${errText}`);
-    }
-  } catch (e) {
-    if (!e.message.includes("fetch")) throw e;
-    log.warn(`Bearer fetch error: ${e.message}`);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenAI ${response.status}: ${errorText.substring(0, 200)}`);
   }
 
-  // ── Attempt 2: Decode ABSK → parse embedded credentials ─────────────────
-  // ABSK keys encode: base64(accessKeyId + ":" + secretAccessKey)
-  try {
-    const decoded  = Buffer.from(BEDROCK_API_KEY.replace(/^ABSK/, ""), "base64").toString("utf8");
-    const colonIdx = decoded.indexOf(":");
-    if (colonIdx > 0) {
-      const accessKeyId     = decoded.substring(0, colonIdx);
-      const secretAccessKey = decoded.substring(colonIdx + 1);
-      log.info(`🔑 Decoded ABSK → keyId=${accessKeyId.substring(0,20)}...`);
-
-      // Use AWS SigV4 signing via SDK with decoded credentials
-      const { BedrockRuntimeClient, InvokeModelCommand } = await import("@aws-sdk/client-bedrock-runtime");
-      const client = new BedrockRuntimeClient({
-        region: AWS_REGION,
-        credentials: { accessKeyId, secretAccessKey },
-      });
-      const cmd = new InvokeModelCommand({
-        modelId: MODEL_ID, contentType: "application/json", accept: "application/json", body,
-      });
-      const resp = await client.send(cmd);
-      const json = JSON.parse(new TextDecoder().decode(resp.body));
-      log.info(`✅ Bedrock OK (decoded ABSK)`);
-      return json;
-    }
-  } catch (e2) {
-    log.error(`Decoded ABSK attempt: ${e2.message}`);
-  }
-
-  // ── Attempt 3: Direct IAM credentials if set in env ─────────────────────
-  if (BEDROCK_KEY_NAME && BEDROCK_KEY_NAME.startsWith("AKIA")) {
-    try {
-      const { BedrockRuntimeClient, InvokeModelCommand } = await import("@aws-sdk/client-bedrock-runtime");
-      const client = new BedrockRuntimeClient({
-        region: AWS_REGION,
-        credentials: { accessKeyId: BEDROCK_KEY_NAME, secretAccessKey: BEDROCK_API_KEY },
-      });
-      const cmd = new InvokeModelCommand({
-        modelId: MODEL_ID, contentType: "application/json", accept: "application/json", body,
-      });
-      const resp = await client.send(cmd);
-      return JSON.parse(new TextDecoder().decode(resp.body));
-    } catch (e3) {
-      log.error(`IAM attempt: ${e3.message}`);
-    }
-  }
-
-  throw new Error("All Bedrock authentication methods failed. Check your credentials.");
+  const json = await response.json();
+  const text = json.choices?.[0]?.message?.content || "";
+  log.info(`✅ OpenAI OK — ${json.usage?.total_tokens ?? "?"} tokens used`);
+  return text;
 }
 
-// ── Metrics ───────────────────────────────────────────────────────────────────
-function updateMetrics(s, inc) {
-  s.responseCount++;
-  const n = s.responseCount, m = s.metrics;
-  m.clarity       = Math.round((m.clarity       * (n-1) + (inc.clarity||6))       / n);
-  m.depth         = Math.round((m.depth         * (n-1) + (inc.depth||6))         / n);
-  m.communication = Math.round((m.communication * (n-1) + (inc.communication||6)) / n);
-  m.overall       = Math.round(((m.clarity + m.depth + m.communication) / 3) * 10);
-}
+// -----------------------------------------------------------------------------
+// ElevenLabs TTS: Convert text to speech, return base64-encoded MP3
+// -----------------------------------------------------------------------------
+async function textToSpeech(text) {
+  if (!ELEVENLABS_KEY || !text) return null;
 
-// ── ElevenLabs TTS ────────────────────────────────────────────────────────────
-async function tts(text) {
-  if (!ELEVENLABS_API_KEY || !text) return null;
   try {
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`, {
-      method: "POST",
-      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-      }),
-    });
-    if (!r.ok) { log.error(`TTS ${r.status}: ${await r.text()}`); return null; }
-    const buf = await r.arrayBuffer();
-    log.info(`🎵 TTS ${(buf.byteLength/1024).toFixed(1)}KB "${text.substring(0,50)}"`);
-    return Buffer.from(buf).toString("base64");
-  } catch (e) {
-    log.error(`TTS error: ${e.message}`);
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+      {
+        method:  "POST",
+        headers: {
+          "xi-api-key":   ELEVENLABS_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text,
+          model_id:      "eleven_monolingual_v1",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      log.error(`TTS ${response.status}: ${await response.text()}`);
+      return null;
+    }
+
+    const buffer = await response.arrayBuffer();
+    log.info(`🎵 TTS ${(buffer.byteLength / 1024).toFixed(1)}KB — "${text.substring(0, 50)}"`);
+    return Buffer.from(buffer).toString("base64");
+
+  } catch (err) {
+    log.error(`TTS error: ${err.message}`);
     return null;
   }
 }
 
-// ── n8n ───────────────────────────────────────────────────────────────────────
-async function sendToN8n(s) {
-  const url = process.env.N8N_WEBHOOK_URL;
-  if (!url) return;
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId: s.id, role: s.role, metrics: s.metrics,
-        questionsAsked: s.currentQ + 1, transcript: s.history,
-        timestamp: new Date().toISOString(),
-      }),
-    });
-    log.info("📊 Results → n8n");
-  } catch (e) { log.error(`n8n: ${e.message}`); }
+// -----------------------------------------------------------------------------
+// Metrics: Rolling average of clarity, depth, communication scores (1–10)
+// -----------------------------------------------------------------------------
+function updateMetrics(session, newScores) {
+  session.responseCount++;
+  const count   = session.responseCount;
+  const metrics = session.metrics;
+
+  // Rolling average formula: new_avg = (old_avg * (n-1) + new_value) / n
+  metrics.clarity       = rollingAvg(metrics.clarity,       newScores.clarity       || 6, count);
+  metrics.depth         = rollingAvg(metrics.depth,         newScores.depth         || 6, count);
+  metrics.communication = rollingAvg(metrics.communication, newScores.communication || 6, count);
+
+  // Overall is the average of all three, scaled to 100
+  metrics.overall = Math.round(((metrics.clarity + metrics.depth + metrics.communication) / 3) * 10);
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+function rollingAvg(previous, newValue, count) {
+  return Math.round((previous * (count - 1) + newValue) / count);
+}
+
+// -----------------------------------------------------------------------------
+// n8n: Send interview results to Google Sheets via n8n webhook
+// -----------------------------------------------------------------------------
+async function sendResultsToN8n(session) {
+  if (!N8N_WEBHOOK_URL) return;
+
+  try {
+    await fetch(N8N_WEBHOOK_URL, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        sessionId:     session.id,
+        role:          session.role,
+        metrics:       session.metrics,
+        questionsAsked: session.currentQ + 1,
+        transcript:    session.history,
+        timestamp:     new Date().toISOString(),
+      }),
+    });
+    log.info("📊 Interview results sent to n8n");
+  } catch (err) {
+    log.error(`n8n webhook: ${err.message}`);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Meeting Page HTML
+// Runs inside Recall.ai's headless Chromium.
+// Connects to Recall.ai transcript WebSocket and drives the interview via API.
+// -----------------------------------------------------------------------------
+function buildMeetingPageHTML(serverUrl, role) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Interview Bot</title>
+  <style>
+    /* ── Reset & Base ── */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 24px;
+      padding: 32px 36px;
+      width: 100%;
+      max-width: 760px;
+      box-shadow: 0 32px 80px rgba(0, 0, 0, 0.6);
+    }
+
+    h1    { text-align: center; font-size: 22px; color: #1a1a2e; margin-bottom: 2px; }
+    .sub  { text-align: center; font-size: 11px; color: #999; margin-bottom: 8px; }
+
+    .badge {
+      display: block;
+      width: fit-content;
+      margin: 0 auto 22px;
+      background: #ede7f6;
+      color: #512da8;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 16px;
+      border-radius: 20px;
+    }
+
+    /* ── Status Bar ── */
+    .status {
+      padding: 11px 18px;
+      border-radius: 10px;
+      text-align: center;
+      font-weight: 600;
+      font-size: 14px;
+      margin-bottom: 18px;
+      transition: background 0.3s, color 0.3s;
+    }
+    .status.idle      { background: #f5f5f5; color: #888; }
+    .status.listening { background: #e8f5e9; color: #2e7d32; }
+    .status.thinking  { background: #fff8e1; color: #e65100; }
+    .status.speaking  { background: #e3f2fd; color: #1565c0; }
+    .status.done      { background: #f3e5f5; color: #6a1b9a; }
+
+    /* ── Waveform Animation ── */
+    .wave {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      height: 42px;
+      margin: 12px 0;
+    }
+    .wave-bar {
+      width: 5px;
+      border-radius: 3px;
+      background: linear-gradient(180deg, #7c3aed, #2563eb);
+      transition: height 0.15s;
+    }
+    .wave-bar:nth-child(1) { height: 8px;  animation-delay: 0.00s; }
+    .wave-bar:nth-child(2) { height: 16px; animation-delay: 0.08s; }
+    .wave-bar:nth-child(3) { height: 28px; animation-delay: 0.16s; }
+    .wave-bar:nth-child(4) { height: 36px; animation-delay: 0.24s; }
+    .wave-bar:nth-child(5) { height: 28px; animation-delay: 0.32s; }
+    .wave-bar:nth-child(6) { height: 16px; animation-delay: 0.40s; }
+    .wave-bar:nth-child(7) { height: 8px;  animation-delay: 0.48s; }
+    .wave.active .wave-bar { animation: wavePulse 0.5s ease-in-out infinite; }
+    @keyframes wavePulse {
+      0%, 100% { transform: scaleY(0.6); }
+      50%       { transform: scaleY(1.4); }
+    }
+
+    /* ── Metrics Cards ── */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric-card {
+      background: #fafafe;
+      border: 1px solid #e8eaf6;
+      border-radius: 12px;
+      padding: 14px;
+      text-align: center;
+    }
+    .metric-card label {
+      display: block;
+      font-size: 10px;
+      color: #9fa8da;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 5px;
+    }
+    .metric-value {
+      font-size: 28px;
+      font-weight: 800;
+      color: #5c35c8;
+    }
+    .overall-score {
+      text-align: center;
+      font-size: 12px;
+      color: #999;
+      margin-bottom: 18px;
+    }
+    .overall-score b { color: #5c35c8; font-size: 14px; }
+
+    /* ── Question Box ── */
+    .question-box {
+      border-left: 4px solid #7c3aed;
+      background: #f9f9ff;
+      padding: 15px 18px;
+      border-radius: 0 12px 12px 0;
+      margin-bottom: 14px;
+      min-height: 64px;
+    }
+    .question-label {
+      font-size: 10px;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .question-text {
+      color: #1a1a2e;
+      font-size: 14px;
+      line-height: 1.6;
+      font-weight: 500;
+    }
+
+    /* ── Transcript Box ── */
+    .transcript-box {
+      background: #fafafa;
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+      min-height: 36px;
+    }
+    .transcript-label {
+      font-size: 10px;
+      color: #bbb;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 3px;
+    }
+    .transcript-text {
+      font-size: 13px;
+      color: #666;
+      font-style: italic;
+      line-height: 1.5;
+    }
+
+    /* ── Progress Bar ── */
+    .progress-wrap  { margin-bottom: 6px; }
+    .progress-track {
+      height: 5px;
+      background: #eee;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 5px;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #7c3aed, #2563eb);
+      border-radius: 3px;
+      transition: width 0.5s;
+      width: 0%;
+    }
+    .progress-label { text-align: center; font-size: 11px; color: #bbb; }
+
+    /* ── Debug Log ── */
+    #debug-log {
+      font-size: 10px;
+      color: #ccc;
+      text-align: center;
+      margin-top: 8px;
+      min-height: 14px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h1>🎤 AI Interview Bot</h1>
+  <p class="sub">Powered by OpenAI GPT-4o · ElevenLabs Voice</p>
+  <span class="badge">Position: ${role}</span>
+
+  <div class="status idle" id="status">⏳ Connecting to meeting...</div>
+
+  <div class="wave" id="wave">
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+    <div class="wave-bar"></div>
+  </div>
+
+  <div class="metrics">
+    <div class="metric-card">
+      <label>Clarity</label>
+      <div class="metric-value" id="metric-clarity">--</div>
+    </div>
+    <div class="metric-card">
+      <label>Tech Depth</label>
+      <div class="metric-value" id="metric-depth">--</div>
+    </div>
+    <div class="metric-card">
+      <label>Communication</label>
+      <div class="metric-value" id="metric-comm">--</div>
+    </div>
+  </div>
+  <div class="overall-score">Overall: <b id="metric-overall">--</b> / 100</div>
+
+  <div class="question-box">
+    <div class="question-label">Current Question</div>
+    <div class="question-text" id="current-question">Initializing...</div>
+  </div>
+
+  <div class="transcript-box">
+    <div class="transcript-label">Candidate is saying...</div>
+    <div class="transcript-text" id="transcript">(listening)</div>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <div class="progress-label" id="progress-label">Starting up...</div>
+  </div>
+
+  <div id="debug-log"></div>
+</div>
+
+<audio id="audio-player" autoplay playsinline style="display:none"></audio>
+
+<script>
+// ── Configuration (injected server-side) ─────────────────────────────────────
+const SERVER_URL = '${serverUrl}';
+const ROLE       = '${role}';
+const SESSION_ID = 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const audioQueue  = [];
+let questions     = [];
+let questionIndex = 0;
+let totalQuestions = 2;
+let isDone        = false;
+let isPlaying     = false;
+let isThinking    = false;
+let accumulated   = '';
+let silenceTimer  = null;
+let lastSentText  = '';
+
+const SILENCE_DELAY_MS = 1800;   // wait this long after last word before processing
+
+// ── DOM Helpers ───────────────────────────────────────────────────────────────
+const el = (id) => document.getElementById(id);
+
+function debug(msg) {
+  el('debug-log').textContent = msg;
+  console.log('[BOT]', msg);
+}
+
+function setStatus(type, msg) {
+  const statusEl = el('status');
+  statusEl.className = 'status ' + type;
+  statusEl.textContent = msg;
+  el('wave').className = 'wave' + (type === 'speaking' ? ' active' : '');
+}
+
+function setMetrics(metrics) {
+  if (!metrics) return;
+  el('metric-clarity').textContent = metrics.clarity       ?? '--';
+  el('metric-depth').textContent   = metrics.depth         ?? '--';
+  el('metric-comm').textContent    = metrics.communication ?? '--';
+  el('metric-overall').textContent = metrics.overall       ?? '--';
+}
+
+function setProgress(index, total) {
+  el('progress-fill').style.width = ((index + 1) / total * 100) + '%';
+  el('progress-label').textContent = 'Question ' + (index + 1) + ' of ' + total;
+}
+
+// ── Audio Playback Queue ──────────────────────────────────────────────────────
+function enqueueAudio(base64, label) {
+  if (!base64) return;
+  audioQueue.push({ base64, label });
+  playNextAudio();
+}
+
+function playNextAudio() {
+  if (isPlaying || audioQueue.length === 0) return;
+  isPlaying = true;
+
+  const { base64, label } = audioQueue.shift();
+  debug('🔊 ' + label.substring(0, 70));
+  setStatus('speaking', '🗣️ Speaking...');
+
+  try {
+    // Decode base64 → Blob URL → play in <audio>
+    const raw    = atob(base64);
+    const bytes  = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+
+    const player = el('audio-player');
+    player.src = blobUrl;
+
+    player.onended = () => {
+      URL.revokeObjectURL(blobUrl);
+      isPlaying = false;
+      setStatus('listening', '👂 Listening...');
+      playNextAudio();
+    };
+    player.onerror = () => {
+      isPlaying = false;
+      playNextAudio();
+    };
+    player.play().catch((err) => {
+      debug('play() failed: ' + err.message);
+      isPlaying = false;
+      playNextAudio();
+    });
+
+  } catch (err) {
+    debug('Audio error: ' + err.message);
+    isPlaying = false;
+    playNextAudio();
+  }
+}
+
+// ── API Calls ─────────────────────────────────────────────────────────────────
+async function apiStart() {
+  debug('Starting session...');
+  setStatus('thinking', '🧠 Generating questions for ' + ROLE + '...');
+
+  try {
+    const response = await fetch(SERVER_URL + '/api/start', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ sessionId: SESSION_ID, role: ROLE }),
+    });
+
+    if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + await response.text());
+
+    const data = await response.json();
+    questions      = data.questions || [];
+    totalQuestions = data.totalQuestions || 2;
+
+    el('current-question').textContent = questions[0] || 'Interview starting...';
+    setProgress(0, totalQuestions);
+    debug('✅ Session started — playing greeting');
+    enqueueAudio(data.audio, data.greeting || '');
+
+  } catch (err) {
+    debug('Start error: ' + err.message);
+    setStatus('idle', '❌ Failed to start: ' + err.message.substring(0, 60));
+  }
+}
+
+async function apiRespond(candidateText) {
+  if (isDone || isThinking) return;
+
+  const text = candidateText.trim();
+  if (text.length < 4 || text === lastSentText) return;
+
+  lastSentText = text;
+  isThinking   = true;
+  el('transcript').textContent = '(processing your answer...)';
+  setStatus('thinking', '🧠 Thinking...');
+
+  try {
+    const response = await fetch(SERVER_URL + '/api/respond', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ sessionId: SESSION_ID, text }),
+    });
+
+    isThinking = false;
+
+    if (response.status === 429) return;   // busy or duplicate — silently ignore
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error('HTTP ' + response.status + ': ' + err);
+    }
+
+    const data = await response.json();
+    setMetrics(data.metrics);
+
+    questionIndex = data.questionIndex ?? questionIndex;
+    setProgress(questionIndex, data.totalQuestions ?? totalQuestions);
+    if (data.currentQ) el('current-question').textContent = data.currentQ;
+
+    if (data.done) {
+      isDone = true;
+      el('current-question').textContent = '✅ Interview complete — thank you!';
+      setStatus('done', '✅ All done!');
+    }
+
+    enqueueAudio(data.audio, data.text || '');
+
+  } catch (err) {
+    isThinking = false;
+    debug('Respond error: ' + err.message.substring(0, 80));
+    setStatus('listening', '👂 Listening...');
+  }
+}
+
+// ── Recall.ai Transcript WebSocket ───────────────────────────────────────────
+// This page runs inside Recall.ai's headless browser.
+// Recall.ai exposes a local transcript WebSocket — no auth needed.
+let ws;
+let reconnectAttempts = 0;
+
+function connectTranscriptFeed() {
+  debug('Connecting to transcript feed...');
+
+  try {
+    ws = new WebSocket('wss://meeting-data.bot.recall.ai/api/v1/transcript');
+  } catch (err) {
+    debug('WebSocket init failed: ' + err.message);
+    setTimeout(connectTranscriptFeed, 4000);
+    return;
+  }
+
+  ws.onopen = () => {
+    reconnectAttempts = 0;
+    debug('✅ Transcript feed connected');
+    setStatus('listening', '👂 Connected — starting interview...');
+    apiStart();
+  };
+
+  ws.onmessage = (event) => {
+    // Ignore transcript while bot is speaking or processing — prevents self-echo
+    if (isPlaying || isThinking || isDone) return;
+
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+
+    // Extract words from Recall.ai transcript payload
+    const words = data?.transcript?.words || data?.words || [];
+    if (!words.length) return;
+
+    const chunk = words.map(w => w.text || w.word || '').join(' ').trim();
+    if (!chunk) return;
+
+    // Accumulate words and show live transcript
+    accumulated = accumulated ? accumulated + ' ' + chunk : chunk;
+    el('transcript').textContent = accumulated;
+
+    // After SILENCE_DELAY_MS with no new words, send the full accumulated text
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+      const finalText = accumulated.trim();
+      accumulated = '';
+      el('transcript').textContent = '(listening)';
+
+      if (finalText.length > 4) {
+        debug('📝 Processing: ' + finalText.substring(0, 80));
+        apiRespond(finalText);
+      }
+    }, SILENCE_DELAY_MS);
+  };
+
+  ws.onerror = (err) => debug('WebSocket error: ' + (err.message || 'unknown'));
+
+  ws.onclose = () => {
+    if (isDone) return;
+    const delay = Math.min(2000 * (++reconnectAttempts), 15000);
+    debug('WebSocket closed — reconnecting in ' + (delay / 1000) + 's');
+    setStatus('idle', '⏳ Reconnecting...');
+    setTimeout(connectTranscriptFeed, delay);
+  };
+}
+
+// Start
+connectTranscriptFeed();
+</script>
+
+</body>
+</html>`;
+}
+
+// -----------------------------------------------------------------------------
+// Start Server
+// -----------------------------------------------------------------------------
 server.listen(PORT, () => {
-  log.info(`\n🚀 AI Interview Bot — port ${PORT}`);
-  log.info(`   /meeting-page?server=DOMAIN&role=Frontend+Developer`);
-  log.info(`   POST /api/start`);
-  log.info(`   POST /api/respond\n`);
+  log.info(`\n🚀 AI Interview Bot running on port ${PORT}`);
+  log.info(`   Meeting page : /meeting-page?server=YOUR_NGROK_HOST&role=Frontend+Developer`);
+  log.info(`   API start    : POST /api/start`);
+  log.info(`   API respond  : POST /api/respond`);
+  log.info(`   Health check : GET  /health\n`);
 });
