@@ -170,18 +170,27 @@ app.post("/webhook/recall/events", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { event, bot_id, call_id, transcript, audio, ...data } = req.body;
+    const event = req.body.event;
+    // Actual Recall.ai payload: bot_id is at data.bot.id (NOT top-level)
+    const bot_id = req.body.data?.bot?.id;
+    const call_id = req.body.data?.recording?.id || req.body.data?.bot?.id;
 
-    log.debug(`Webhook event: ${event}`);
+    log.info(`📨 Webhook event: "${event}" | bot: ${bot_id}`);
 
-    // Get or create session
-    const sessionKey = `${bot_id}-${call_id}`;
+    if (!bot_id) {
+      log.warn(`Missing bot_id in webhook payload. Body: ${JSON.stringify(req.body).substring(0, 300)}`);
+      return res.status(200).json({ status: "ok", note: "no bot_id" });
+    }
+
+    // Session key uses bot_id only (call_id is not always present in initial events)
+    const sessionKey = bot_id;
     let session = interviewSessions.get(sessionKey);
 
     // Only require session to exist for non-initial events
     if (!session && event !== "bot.in_call_recording") {
-      log.warn(`Session not found for ${sessionKey}`);
-      return res.status(400).json({ error: "Session not found" });
+      log.warn(`Session not found for bot: ${bot_id}, event: ${event}`);
+      // Don't block — return ok to avoid Recall.ai retrying endlessly
+      return res.status(200).json({ status: "ok", note: "session not found" });
     }
 
     // Handle different event types (matching Recall.ai actual events)
@@ -239,54 +248,53 @@ app.post("/webhook/recall/events", async (req, res) => {
         interviewSessions.delete(sessionKey);
         break;
 
-      // Real-time audio event (for monitoring)
-      case "audio_separate_raw.data":
-        log.debug(`🔊 Audio data received`);
-        if (session && req.body.data && req.body.data.data) {
-          const audioData = req.body.data.data;
-          const participant = audioData.participant;
-          log.debug(`Audio from participant: ${participant.name || participant.id}`);
-
-          // Mark that participant is speaking (for UI feedback)
-          session.isListening = true;
-          session.lastAudioTime = Date.now();
-        }
+      // Participant speech events (monitoring only)
+      case "participant_events.speech_on":
+        log.debug(`🎤 Participant started speaking`);
+        if (session) session.isListening = true;
         break;
 
-      // Real-time transcript event (primary processing)
-      case "transcript.data":
-      case "transcript.partial_data":
-        log.debug(`📝 Transcript received: ${event}`);
-        if (session && req.body.data && req.body.data.data) {
-          const transcriptData = req.body.data.data;
-          const participant = transcriptData.participant;
+      case "participant_events.speech_off":
+        log.debug(`🤫 Participant stopped speaking`);
+        if (session) session.isListening = false;
+        break;
 
-          // Extract words from transcript
-          if (transcriptData.words && transcriptData.words.length > 0) {
-            const text = transcriptData.words.map(w => w.text).join(' ');
-            log.debug(`${participant.name || 'Participant'}: ${text}`);
+      // Real-time transcript — FINALIZED (primary processing trigger)
+      case "transcript.data": {
+        // Payload: req.body.data.data.words[]
+        const tData = req.body.data?.data;
+        const participant = tData?.participant;
+        const words = tData?.words;
 
+        if (session && words && words.length > 0) {
+          // Skip bot's own speech (participant is host or named "AI Interview Bot")
+          const participantName = participant?.name || "";
+          if (participantName.toLowerCase().includes("interview bot") ||
+              participantName.toLowerCase().includes("ai bot")) {
+            log.debug(`Skipping bot's own transcript`);
+            break;
+          }
+
+          const text = words.map(w => w.text).join(" ").trim();
+          if (text.length > 2) {
+            log.info(`📝 Transcript [${participantName || "Participant"}]: "${text.substring(0, 100)}"`);
             session.currentTranscript = text;
             session.lastActivity = Date.now();
-            session.isListening = true;
-
-            // Only process finalized transcripts to avoid duplicate processing
-            if (event === 'transcript.data') {
-              log.info(`Processing participant response: "${text.substring(0, 100)}..."`);
-              await processParticipantResponse(session, text);
-            }
+            await processParticipantResponse(session, text);
           }
         }
         break;
+      }
 
-      // Silence detected - candidate stopped speaking
-      case "participant.left":
-      case "participant.speech_final":
-        log.debug(`🎤 Participant finished speaking`);
-        if (session) {
-          session.isListening = false;
+      // Partial transcript — update display only (don't process)
+      case "transcript.partial_data": {
+        const pData = req.body.data?.data;
+        if (session && pData?.words?.length > 0) {
+          const partialText = pData.words.map(w => w.text).join(" ");
+          session.partialTranscript = partialText;
         }
         break;
+      }
 
       default:
         log.debug(`Received event: ${event}`);
@@ -534,40 +542,116 @@ app.get("/meeting-page", (req, res) => {
     </div>
   </div>
 
+  <!-- Hidden audio element - Recall.ai captures this audio into the Teams meeting -->
+  <audio id="bot-audio" autoplay playsinline></audio>
+
   <script>
-    // Connect to interview bot via WebSocket
     const serverUrl = '${serverUrl}';
     const wsProtocol = '${wsProtocol}';
-    const ws = new WebSocket(wsProtocol + '://' + serverUrl + '/ws/interview');
+    const statusEl = document.querySelector('.status');
+    const audioEl = document.getElementById('bot-audio');
 
-    ws.onopen = () => {
-      console.log('Connected to interview bot');
-    };
+    // Audio queue to prevent overlapping playback
+    const audioQueue = [];
+    let isPlaying = false;
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    function playNextAudio() {
+      if (isPlaying || audioQueue.length === 0) return;
+      isPlaying = true;
 
-      // Update metrics
-      if (data.metrics) {
-        document.getElementById('clarity').textContent = data.metrics.clarity || '--';
-        document.getElementById('depth').textContent = data.metrics.depth || '--';
-        document.getElementById('communication').textContent = data.metrics.communication || '--';
+      const { base64, text } = audioQueue.shift();
+
+      try {
+        // Convert base64 MP3 → Blob → Object URL → play
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+
+        audioEl.src = url;
+        audioEl.onended = () => {
+          URL.revokeObjectURL(url);
+          isPlaying = false;
+          statusEl.className = 'status listening';
+          statusEl.textContent = '👂 Listening to candidate...';
+          playNextAudio(); // Play next in queue
+        };
+        audioEl.onerror = (e) => {
+          console.error('Audio play error', e);
+          isPlaying = false;
+          playNextAudio();
+        };
+
+        statusEl.className = 'status speaking';
+        statusEl.textContent = '🗣️ AI is speaking...';
+        audioEl.play().catch(e => {
+          console.error('Play failed:', e);
+          isPlaying = false;
+          playNextAudio();
+        });
+      } catch (e) {
+        console.error('Audio decode error:', e);
+        isPlaying = false;
+        playNextAudio();
       }
+    }
 
-      // Update question
-      if (data.question) {
-        document.getElementById('current-question').textContent = data.question;
-      }
+    // WebSocket connection with auto-reconnect
+    let ws;
+    function connectWS() {
+      ws = new WebSocket(wsProtocol + '://' + serverUrl + '/ws/interview');
 
-      // Update progress
-      if (data.progress) {
-        document.getElementById('progress').textContent = data.progress;
-      }
-    };
+      ws.onopen = () => {
+        console.log('✅ Connected to interview bot server');
+        document.getElementById('progress').textContent = 'Connected - waiting for interview to start...';
+      };
 
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-    };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          // 🔊 Audio message — queue and play
+          if (data.type === 'audio' && data.audio) {
+            console.log('🔊 Audio received, queuing playback');
+            audioQueue.push({ base64: data.audio, text: data.text || '' });
+            playNextAudio();
+            return;
+          }
+
+          // 📊 Metrics update
+          if (data.metrics) {
+            document.getElementById('clarity').textContent = data.metrics.clarity ?? '--';
+            document.getElementById('depth').textContent = data.metrics.depth ?? '--';
+            document.getElementById('communication').textContent = data.metrics.communication ?? '--';
+          }
+
+          // ❓ Question update
+          if (data.question) {
+            document.getElementById('current-question').textContent = data.question;
+          }
+
+          // 📈 Progress update
+          if (data.progress) {
+            document.getElementById('progress').textContent = data.progress;
+          }
+
+        } catch (e) {
+          console.error('Message parse error:', e);
+        }
+      };
+
+      ws.onerror = (e) => console.error('WebSocket error:', e);
+
+      ws.onclose = () => {
+        console.log('⚠️ WebSocket closed, reconnecting in 3s...');
+        document.getElementById('progress').textContent = 'Reconnecting...';
+        setTimeout(connectWS, 3000);
+      };
+    }
+
+    // Start connection
+    connectWS();
   </script>
 </body>
 </html>
@@ -900,70 +984,71 @@ async function sendResultsToN8n(results, retries = 3) {
 }
 
 /**
- * Convert text to speech using ElevenLabs API and send to meeting
- * Returns boolean indicating success/failure
+ * Convert text to speech using ElevenLabs API.
+ * Audio is sent to the meeting page via WebSocket — the webpage plays it,
+ * and Recall.ai captures the webpage's audio output into the meeting.
+ *
+ * NOTE: output_audio API endpoint CANNOT be used when output_media is active.
+ * The webpage IS the audio source. See: https://docs.recall.ai/docs/output-audio-in-meetings
  */
 async function textToSpeech(text, botId, callId) {
   const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
   const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
   if (!ELEVENLABS_API_KEY) {
-    log.error("❌ ElevenLabs API key NOT configured - TTS disabled");
+    log.error("❌ ElevenLabs API key NOT configured");
     return false;
   }
 
-  if (!ELEVENLABS_VOICE_ID) {
-    log.error("❌ ElevenLabs Voice ID NOT configured");
-    return false;
-  }
-
-  if (!botId || !callId) {
-    log.error(`❌ Missing bot_id or call_id for TTS`);
+  if (!botId) {
+    log.error(`❌ Missing bot_id for TTS`);
     return false;
   }
 
   try {
     const textPreview = text.length > 60 ? text.substring(0, 60) + "..." : text;
-    log.debug(`🎵 Converting to speech (${text.length} chars): "${textPreview}"`);
+    log.info(`🎵 TTS: "${textPreview}"`);
 
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text: text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
         },
-      }),
-    });
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_monolingual_v1",
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      }
+    );
 
     if (!response.ok) {
-      const errorText = await response.text();
-      log.error(`❌ ElevenLabs API error ${response.status}: ${errorText}`);
+      const err = await response.text();
+      log.error(`❌ ElevenLabs ${response.status}: ${err}`);
       return false;
     }
 
     const audioBuffer = await response.arrayBuffer();
-    log.debug(`✅ TTS generated ${audioBuffer.byteLength} bytes`);
-
     if (audioBuffer.byteLength === 0) {
-      log.error(`❌ ElevenLabs returned empty audio buffer`);
+      log.error(`❌ ElevenLabs returned empty audio`);
       return false;
     }
 
-    // Send audio to Recall.ai to play in meeting
-    const sendResult = await sendAudioToMeeting(botId, callId, audioBuffer);
-    if (!sendResult) {
-      log.error(`❌ Failed to send audio to meeting`);
-      return false;
+    log.info(`✅ TTS generated ${(audioBuffer.byteLength / 1024).toFixed(1)} KB`);
+
+    // Send base64 audio to meeting page via WebSocket.
+    // The webpage plays it with <audio> element — Recall.ai captures that audio into Teams.
+    const base64Audio = Buffer.from(audioBuffer).toString("base64");
+    const sent = sendAudioToMeetingPage(base64Audio, text);
+
+    if (!sent) {
+      log.warn(`⚠️  No meeting page connected to receive audio (WebSocket clients: ${wss.clients.size})`);
+      // Still return true — audio was generated, page just not connected yet
     }
 
-    log.info(`✅ Audio played in meeting`);
     return true;
 
   } catch (error) {
@@ -973,66 +1058,44 @@ async function textToSpeech(text, botId, callId) {
 }
 
 /**
- * Send audio to Recall.ai bot to play in meeting
- * Uses the output_audio endpoint to stream audio back to participants
+ * Send base64 MP3 audio to the meeting page via WebSocket.
+ *
+ * Architecture (output_media mode):
+ *   Server → WebSocket → Meeting page (Recall.ai headless browser)
+ *   Meeting page plays <audio> element
+ *   Recall.ai captures webpage audio → streams into Teams meeting
+ *
+ * WHY NOT output_audio API:
+ *   output_media (webpage) and output_audio API are mutually exclusive.
+ *   When using output_media, the webpage IS the audio source.
  */
-async function sendAudioToMeeting(botId, callId, audioBuffer) {
-  const RECALL_API_KEY = process.env.RECALL_API_KEY;
+function sendAudioToMeetingPage(base64Audio, text) {
+  if (!wss || !wss.clients) return false;
 
-  if (!RECALL_API_KEY) {
-    log.error(`❌ RECALL_API_KEY not configured`);
-    return false;
-  }
+  const payload = JSON.stringify({
+    type: "audio",
+    audio: base64Audio,           // base64 MP3
+    text: text || "",             // for display in UI
+    timestamp: Date.now(),
+  });
 
-  if (!botId) {
-    log.error(`❌ Bot ID is required`);
-    return false;
-  }
-
-  if (!audioBuffer || audioBuffer.byteLength === 0) {
-    log.error(`❌ Audio buffer is empty or invalid`);
-    return false;
-  }
-
-  try {
-    // Convert ArrayBuffer to base64 string
-    const base64Audio = Buffer.from(audioBuffer).toString("base64");
-    const audioSizeKB = (audioBuffer.byteLength / 1024).toFixed(2);
-
-    log.debug(`📤 Sending audio to Recall.ai (${audioSizeKB} KB, ${audioBuffer.byteLength} bytes)`);
-
-    const response = await fetch(
-      `https://ap-northeast-1.recall.ai/api/v1/bot/${botId}/output_audio`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Token ${RECALL_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          audio_buffer_base64: base64Audio,
-          encoding: "mp3",
-          sample_rate: 44100,
-        }),
+  let sentCount = 0;
+  wss.clients.forEach((client) => {
+    if (client && client.readyState === 1) {
+      try {
+        client.send(payload);
+        sentCount++;
+      } catch (e) {
+        log.debug(`WS send failed: ${e.message}`);
       }
-    );
-
-    if (response.ok || response.status === 200 || response.status === 201) {
-      log.debug(`✅ Audio accepted by Recall.ai (${response.status})`);
-      return true;
-    } else if (response.status === 404) {
-      // Bot may not exist or already ended call
-      log.warn(`⚠️  Bot not found or call ended (${response.status}) - audio not queued`);
-      return false;
-    } else {
-      const errorText = await response.text();
-      log.error(`❌ Recall.ai error (${response.status}): ${errorText}`);
-      return false;
     }
-  } catch (error) {
-    log.error(`❌ Failed to send audio: ${error.message}`);
-    return false;
+  });
+
+  if (sentCount > 0) {
+    log.info(`📤 Audio sent to ${sentCount} meeting page(s) via WebSocket`);
   }
+
+  return sentCount > 0;
 }
 
 /**
