@@ -17,7 +17,15 @@
  * @returns {Promise<{success, bot_id, joined_at, meeting_url, candidate_name, role, interview_config}>}
  */
 export async function scheduleInterviewBot(config) {
-  const RECALL_REGION = process.env.RECALL_REGION || "ap-northeast-1";
+  // Validate and use RECALL_REGION
+  const VALID_REGIONS = ["us-east-1", "eu-west-1", "ap-northeast-1", "ap-south-1"];
+  let RECALL_REGION = process.env.RECALL_REGION || "us-east-1";
+  
+  if (!VALID_REGIONS.includes(RECALL_REGION)) {
+    console.warn(`[BotScheduler] Invalid RECALL_REGION: "${RECALL_REGION}". Using default "us-east-1"`);
+    RECALL_REGION = "us-east-1";
+  }
+  
   const RECALL_API    = `https://${RECALL_REGION}.recall.ai/api/v1`;
 
   const {
@@ -104,6 +112,14 @@ export async function scheduleInterviewBot(config) {
           },
         },
       },
+      // Real-time transcript delivery via webhook (CRITICAL: must be configured here)
+      realtime_endpoints: [
+        {
+          type: "webhook",
+          url: `${ngrok_url}/webhook/recall/transcript`,
+          events: ["transcript.data", "transcript.partial_data"],
+        },
+      ],
     },
 
     // Store interview metadata on the bot for lookup later
@@ -227,4 +243,68 @@ export function parseResume(resumeText) {
     experience_years: years ? parseInt(years[1]) : null,
     technologies:     [...new Set(techs)],
   };
+}
+
+/**
+ * Retrieve bot artifacts after interview completes.
+ * Called when bot.done or bot.call_ended event fires.
+ *
+ * @param {string} botId - Recall.ai bot ID
+ * @returns {Promise<{success, transcript_url, report_url, media_shortcuts, error}>}
+ */
+export async function retrieveBotArtifacts(botId) {
+  const RECALL_REGION = process.env.RECALL_REGION || "us-east-1";
+  const RECALL_API    = `https://${RECALL_REGION}.recall.ai/api/v1`;
+  const RECALL_API_KEY = process.env.RECALL_API_KEY;
+
+  if (!RECALL_API_KEY) {
+    return { success: false, error: "RECALL_API_KEY not set" };
+  }
+
+  if (!botId) {
+    return { success: false, error: "botId is required" };
+  }
+
+  try {
+    console.log(`[Artifacts] Retrieving for bot ${botId}`);
+
+    const response = await fetch(`${RECALL_API}/bots/${botId}`, {
+      method: "GET",
+      headers: {
+        "Authorization": `Token ${RECALL_API_KEY}`,
+        "Accept": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        success: false,
+        error: `Recall.ai API error: ${response.status} ${errorText}`,
+      };
+    }
+
+    const data = await response.json();
+    const bot = data.data || data; // Handle both response structures
+
+    // Extract media shortcuts (transcript, report, summary)
+    const transcriptUrl = bot.media_shortcuts?.transcript || null;
+    const reportUrl     = bot.media_shortcuts?.report     || null;
+    const summaryUrl    = bot.media_shortcuts?.summary    || null;
+
+    console.log(`[Artifacts] Retrieved: transcript=${!!transcriptUrl}, report=${!!reportUrl}, summary=${!!summaryUrl}`);
+
+    return {
+      success: true,
+      botId,
+      transcript_url:  transcriptUrl,
+      report_url:      reportUrl,
+      summary_url:     summaryUrl,
+      media_shortcuts: bot.media_shortcuts || {},
+      status:          bot.status,
+    };
+  } catch (err) {
+    console.error(`[Artifacts] Fetch error:`, err.message);
+    return { success: false, error: err.message };
+  }
 }

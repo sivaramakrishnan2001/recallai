@@ -4,7 +4,10 @@ import { generateReport } from "./evaluator.js";
 
 export async function sendResultsToN8n(session) {
   const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
-  if (!N8N_WEBHOOK_URL) return;
+  if (!N8N_WEBHOOK_URL) {
+    console.warn("[n8n] N8N_WEBHOOK_URL not set — skipping result delivery");
+    return;
+  }
 
   try {
     const report = generateReport(session);

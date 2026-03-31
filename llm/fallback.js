@@ -10,7 +10,7 @@ const FALLBACK_RESPONSES = [
 
 let responseIndex = 0;
 
-export function callFallback(messages, systemPrompt) {
+export async function callFallback(messages, systemPrompt) {
   // Return a rotating template response
   const response = FALLBACK_RESPONSES[responseIndex % FALLBACK_RESPONSES.length];
   responseIndex++;

@@ -1,6 +1,7 @@
 // Answer Evaluator — Parse LLM responses, extract scores, generate reports
 
-const META_REGEX = /\[META\]\s*phase:(\w+)\s+action:(\w+)\s+comm:(\d+)\s+tech:(\d+)\s+solve:(\d+)\s+exp:(\d+)\s+question:(.*)/i;
+// Improved regex that handles special characters in question field
+const META_REGEX = /\[META\]\s*phase:(\w+)\s+action:(\w+)\s+comm:(\d+)\s+tech:(\d+)\s+solve:(\d+)\s+exp:(\d+)\s+question:(.*?)(?:\n|$)/i;
 
 function calculateAllScoreAverages(scores) {
   const stat = (arr) => {
@@ -72,6 +73,7 @@ export function avg(arr) {
 
 /**
  * Generate Report — Optimized to calculate all averages in one pass
+ * Applies proper weighting: Technical(40%) + Communication(20%) + Experience(20%) + ProblemSolving(20%)
  */
 export function generateReport(session) {
   // Calculate all score averages efficiently
@@ -82,16 +84,36 @@ export function generateReport(session) {
   const solveScore = stats.problemSolving.avg;
   const expScore = stats.practicalExperience.avg;
 
+  // Calculate weighted overall score
   // Only include dimensions that were actually tested (have scores)
-  const testedScores = [];
-  if (stats.communication.count > 0)      testedScores.push(commScore);
-  if (stats.technicalKnowledge.count > 0)  testedScores.push(techScore);
-  if (stats.problemSolving.count > 0)      testedScores.push(solveScore);
-  if (stats.practicalExperience.count > 0)  testedScores.push(expScore);
-
-  const overall = testedScores.length > 0
-    ? Math.round(testedScores.reduce((a, b) => a + b, 0) / testedScores.length * 10) / 10
-    : 0;
+  let overall = 0;
+  if (stats.communication.count > 0 || stats.technicalKnowledge.count > 0 || 
+      stats.problemSolving.count > 0 || stats.practicalExperience.count > 0) {
+    
+    // Apply weighted calculation
+    let weightedSum = 0;
+    let totalWeight = 0;
+    
+    if (stats.communication.count > 0) {
+      weightedSum += commScore * 0.20;
+      totalWeight += 0.20;
+    }
+    if (stats.technicalKnowledge.count > 0) {
+      weightedSum += techScore * 0.40;
+      totalWeight += 0.40;
+    }
+    if (stats.problemSolving.count > 0) {
+      weightedSum += solveScore * 0.20;
+      totalWeight += 0.20;
+    }
+    if (stats.practicalExperience.count > 0) {
+      weightedSum += expScore * 0.20;
+      totalWeight += 0.20;
+    }
+    
+    // Normalize to 0-100 scale
+    overall = totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 10) / 10 : 0;
+  }
 
   const strengths  = [];
   const weaknesses = [];
@@ -119,20 +141,24 @@ export function generateReport(session) {
     role:               session.role,
     difficulty:         session.difficulty,
     interview_type:     session.interviewType,
-    overall_score:      `${overall}/10`,
-    technical_score:    stats.technicalKnowledge.count  > 0 ? `${techScore}/10`  : "N/A",
-    communication_score: stats.communication.count     > 0 ? `${commScore}/10`  : "N/A",
-    problem_solving_score: stats.problemSolving.count  > 0 ? `${solveScore}/10` : "N/A",
-    experience_score:   stats.practicalExperience.count > 0 ? `${expScore}/10`  : "N/A",
+    overall_score:      overall,  // Numeric 0–10 (weighted avg of dimension scores)
+    overall_score_str:  `${overall}/10`,
+    technical_score:    stats.technicalKnowledge.count  > 0 ? techScore : null,
+    communication_score: stats.communication.count     > 0 ? commScore : null,
+    problem_solving_score: stats.problemSolving.count  > 0 ? solveScore : null,
+    experience_score:   stats.practicalExperience.count > 0 ? expScore : null,
     strengths:          strengths.length ? strengths : ["No clear strengths identified"],
     weaknesses:         weaknesses.length ? weaknesses : ["No clear weaknesses identified"],
     recommended_hire:   overall >= 6,
+    hiring_decision: overall >= 7.5 ? "STRONG_YES" : overall >= 6 ? "YES" : overall >= 4.5 ? "MAYBE" : "NO",
     questions_asked:    session.questionsAsked.length,
-    summary: overall >= 7
+    summary: overall >= 7.5
       ? `${session.candidateName} demonstrated strong skills across the board for the ${session.role} role. Recommend proceeding to next round.`
-      : overall >= 5
-        ? `${session.candidateName} showed potential but has areas for improvement. Consider a follow-up interview focusing on weaker areas.`
-        : `${session.candidateName} did not meet the threshold for the ${session.role} role at this time.`,
+      : overall >= 6
+        ? `${session.candidateName} showed solid potential. Consider moving forward for further evaluation.`
+        : overall >= 4.5
+          ? `${session.candidateName} showed some potential but has areas for improvement. Consider a follow-up interview.`
+          : `${session.candidateName} did not meet the threshold for the ${session.role} role at this time.`,
     transcript: session.history,
     timestamp: new Date().toISOString(),
     duration_minutes: Math.round((Date.now() - session.startTime) / 60000),

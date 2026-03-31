@@ -43,7 +43,7 @@ export async function callBedrock(messages, systemPrompt, maxTokens = 500) {
     const bodyStr = new TextDecoder().decode(response.body);
     const bodyObj = JSON.parse(bodyStr);
 
-    const tokenCount = bodyObj.usage?.input_tokens + bodyObj.usage?.output_tokens || "?";
+    const tokenCount = (bodyObj.usage?.input_tokens ?? 0) + (bodyObj.usage?.output_tokens ?? 0) || "?";
     console.log(`[Bedrock] ${tokenCount} tokens`);
 
     return bodyObj.content?.[0]?.text || "";

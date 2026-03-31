@@ -1,6 +1,10 @@
 // Session Management Module
 // Handles: session creation, lifecycle, GC, and storage
 
+import { EventEmitter } from 'events';
+
+const eventEmitter = new EventEmitter();
+
 const PHASE = {
   INTRODUCTION: "introduction",
   RESUME:       "resume",
@@ -81,7 +85,7 @@ export function getAllSessions() {
 
 /**
  * Initialize garbage collection with proper cleanup
- * Marks old sessions for deletion and trims history
+ * Deletes old sessions and warns about large history
  */
 export function initializeGarbageCollection() {
   if (gcInterval) clearInterval(gcInterval); // Prevent duplicate intervals
@@ -89,6 +93,7 @@ export function initializeGarbageCollection() {
   gcInterval = setInterval(() => {
     const now = Date.now();
     let deletedCount = 0;
+    let largeHistorySessions = [];
     
     // Use iterator to avoid concurrent modification issues
     for (const [id, session] of sessions.entries()) {
@@ -96,15 +101,26 @@ export function initializeGarbageCollection() {
         sessions.delete(id);
         deletedCount++;
       } else {
-        // Trim history to prevent unbounded growth
+        // Monitor but DON'T trim — keep full conversation history for LLM context
         if (session.history.length > MAX_HISTORY_SIZE) {
-          session.history = session.history.slice(-MAX_HISTORY_SIZE);
+          largeHistorySessions.push({
+            id,
+            historySize: session.history.length,
+            duration: Math.round((now - session.startTime) / 60000),
+          });
         }
       }
     }
     
     if (deletedCount > 0) {
       console.log(`[GC] Cleaned up ${deletedCount} expired session(s). Active: ${sessions.size}`);
+    }
+    
+    if (largeHistorySessions.length > 0) {
+      console.warn(`[GC] ${largeHistorySessions.length} session(s) with large history:`);
+      largeHistorySessions.forEach(s => {
+        console.warn(`     ${s.id}: ${s.historySize} messages (${s.duration}m duration)`);
+      });
     }
   }, SESSION_GC_MS);
 }
@@ -146,4 +162,4 @@ export function isTimeExpired(session) {
   return getRemainingTime(session) <= 0;
 }
 
-export { PHASE, PHASE_QUESTION_COUNTS, SESSION_TTL_MS };
+export { PHASE, PHASE_QUESTION_COUNTS, SESSION_TTL_MS, eventEmitter };

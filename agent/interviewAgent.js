@@ -75,7 +75,14 @@ export async function getInterviewerResponse(session, candidateText) {
 
   // Handle phase transitions based on LLM's indicated action
   if (parsed.phase && parsed.phase !== session.phase) {
-    session.phase = parsed.phase;
+    // Validate phase is in valid PHASE enum before setting
+    const validPhases = Object.values(PHASE);
+    if (validPhases.includes(parsed.phase)) {
+      console.log(`[Agent] Phase transition: ${session.phase} → ${parsed.phase}`);
+      session.phase = parsed.phase;
+    } else {
+      console.warn(`[Agent] LLM returned invalid phase: "${parsed.phase}". Ignoring.`);
+    }
   }
 
   // TIME MANAGEMENT: If time < 2 minutes and not already warned, force transition to closing

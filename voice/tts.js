@@ -9,11 +9,10 @@ export async function textToSpeech(text) {
 
   if (!text || !text.trim()) return null;
 
-  // Require API key for TTS
+  // Return null if no API key (allows dev/test without ElevenLabs)
   if (!ELEVENLABS_KEY) {
-    const error = new Error("ELEVENLABS_API_KEY not configured. Cannot generate audio. Please set ELEVENLABS_API_KEY in .env");
-    error.code = "MISSING_ELEVENLABS_KEY";
-    throw error;
+    console.log("[TTS] ELEVENLABS_API_KEY not set — audio disabled");
+    return null;
   }
 
   const clean = text.replace(/\[META\].*$/ims, "").trim();

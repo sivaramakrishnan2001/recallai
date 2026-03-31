@@ -16,6 +16,7 @@ dotenv.config(); // MUST be first before other imports
 import express from "express";
 import cors from "cors";
 import { createServer } from "http";
+import { createHash } from "crypto";
 
 import {
   createSession,
@@ -31,7 +32,7 @@ import { initializeProvider, getActiveProvider } from "./llm/factory.js";
 import { getInterviewerResponse, getGreeting, getSilencePrompt } from "./agent/interviewAgent.js";
 import { generateReport } from "./tools/evaluator.js";
 import { sendResultsToN8n } from "./tools/webhookSender.js";
-import { scheduleInterviewBot, batchScheduleInterviews } from "./tools/botScheduler.js";
+import { scheduleInterviewBot, batchScheduleInterviews, retrieveBotArtifacts } from "./tools/botScheduler.js";
 
 const PORT = process.env.PORT || 3000;
 const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
@@ -52,6 +53,91 @@ const server = createServer(app);
 
 app.use(express.json({ limit: "10mb" }));
 app.use(cors());
+
+// =============================================================================
+// Process Queue & Deduplication (for webhook reliability)
+// =============================================================================
+const processedEvents = new Map(); // { dedupKey -> timestamp }
+const EVENT_DEDUP_TTL = 5 * 60 * 1000; // 5 minutes
+const transcriptQueue = []; // Simple async queue for webhook processing
+let isProcessing = false; // Prevent multiple concurrent queue processors
+
+/**
+ * Create a dedup key for transcript events to prevent duplicates
+ * Uses MD5 hash of text for robust collision detection
+ * @param {string} botId - Recall.ai bot ID
+ * @param {string} event - Event type (transcript.data, transcript.partial_data)
+ * @param {string} text - Transcript text
+ * @param {number} timestamp - When the event occurred (from Recall.ai)
+ * @returns {string} Dedup key
+ */
+function createDedupKey(botId, event, text, timestamp) {
+  // Hash the full text (not just first 50 chars) to avoid collisions
+  const textHash = createHash('md5').update(text).digest('hex').substring(0, 16);
+  return `${botId}_${event}_${textHash}_${Math.floor(timestamp / 1000)}`; // Round to second
+}
+
+/**
+ * Check if event was already processed (dedup)
+ * @param {string} key - Dedup key
+ * @returns {boolean} True if already processed
+ */
+function isDuplicate(key) {
+  if (processedEvents.has(key)) {
+    return true;
+  }
+  // Record that we saw this event
+  processedEvents.set(key, Date.now());
+  
+  // Cleanup old entries
+  if (processedEvents.size > 1000) {
+    for (const [k, v] of processedEvents.entries()) {
+      if (Date.now() - v > EVENT_DEDUP_TTL) {
+        processedEvents.delete(k);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Queue transcript processing to run asynchronously
+ * (webhooks must ACK fast to prevent Recall.ai retries)
+ * 
+ * Uses a single processor to prevent race conditions
+ */
+function queueTranscriptProcessing(sessionId, session, text) {
+  transcriptQueue.push({ sessionId, session, text });
+  
+  // Process queue async (don't block webhook handler)
+  // Only start processing if not already running
+  if (!isProcessing) {
+    isProcessing = true;
+    setImmediate(async () => {
+      while (transcriptQueue.length > 0) {
+        const task = transcriptQueue.shift();
+        try {
+          // Get fresh session reference to avoid stale data
+          const freshSession = getSession(task.sessionId);
+          if (!freshSession) {
+            console.warn(`[Queue] Session disappeared: ${task.sessionId}`);
+            continue;
+          }
+          
+          await getInterviewerResponse(freshSession, task.text);
+          if (freshSession.done) {
+            const report = generateReport(freshSession);
+            await sendResultsToN8n(freshSession);
+            console.log(`[Interview] Complete [${task.sessionId}] score=${report.overall_score}`);
+          }
+        } catch (err) {
+          console.error(`[Queue] Error processing transcript:`, err.message);
+        }
+      }
+      isProcessing = false;
+    });
+  }
+}
 
 // =============================================================================
 // GET /health
@@ -337,15 +423,18 @@ app.get("/api/report/:sessionId", (req, res) => {
 //   bot.call_ended         — meeting ended; finalize report
 //   bot.done               — bot fully shut down (backup finalizer)
 // =============================================================================
-app.post("/webhook/recall/events", (req, res) => {
+app.post("/webhook/recall/events", async (req, res) => {
   // Payload shape: { event: "bot.in_call_recording", data: { bot: { id, metadata } } }
   const event  = req.body?.event;
   const botId  = req.body?.data?.bot?.id;
   const meta   = req.body?.data?.bot?.metadata || {};
 
+  // ACK immediately; process async in background
+  res.json({ ok: true });
+
   console.log(`[Recall webhook] ${event} — bot: ${botId}`);
 
-  if (!botId) return res.json({ ok: true });
+  if (!botId) return;
 
   const sessionId = `bot_${botId}`;
 
@@ -364,15 +453,110 @@ app.post("/webhook/recall/events", (req, res) => {
   }
 
   if (event === "bot.call_ended" || event === "bot.done") {
+    // Interview ended: finalize session and retrieve artifacts
     const session = getSession(sessionId);
     if (session && !session.done) {
       session.done = true;
-      sendResultsToN8n(session);
-      console.log(`[Recall webhook] Interview finalised for session ${sessionId}`);
+      
+      // Queue artifact retrieval in background (don't block webhook response)
+      setImmediate(async () => {
+        try {
+          console.log(`[Bot.done] Retrieving artifacts for bot ${botId}`);
+          const artifacts = await retrieveBotArtifacts(botId);
+          if (artifacts.success) {
+            // Attach artifacts to session
+            session.transcript_url = artifacts.transcript_url;
+            session.report_url     = artifacts.report_url;
+            session.summary_url    = artifacts.summary_url;
+            console.log(`[Bot.done] Artifacts retrieved and attached to session`);
+          } else {
+            console.warn(`[Bot.done] Artifact retrieval failed: ${artifacts.error}`);
+          }
+        } catch (err) {
+          console.error(`[Bot.done] Artifact error:`, err.message);
+        }
+        
+        // Send results to n8n (now with artifacts attached)
+        await sendResultsToN8n(session);
+        console.log(`[Recall webhook] Interview finalised for session ${sessionId}`);
+      });
     }
   }
+});
 
+// =============================================================================
+// POST /webhook/recall/transcript
+// Real-time transcript webhook from Recall.ai
+// PATTERN: ACK immediately (2xx), queue work async to prevent retries
+// Format per docs: { "event": "transcript.data"|"transcript.partial_data",
+//                    "data": { "data": { "words": [...], "participant": {...} } } }
+// =============================================================================
+app.post("/webhook/recall/transcript", (req, res) => {
+  // 1. ACK FIRST: Return 200 OK immediately (must complete in <2s)
   res.json({ ok: true });
+
+  // 2. Quick validation
+  const event = req.body?.event;
+  const data = req.body?.data?.data || {};
+  const words = data.words || [];
+  const participant = data.participant || {};
+  
+  if (!words.length) return; // No speech data
+
+  const text = words.map(w => w.text).join(" ");
+  const isPartial = event === "transcript.partial_data";
+  const participantName = participant.name || "Unknown";
+  const botId = req.body?.data?.bot?.id;
+
+  console.log(`[Transcript] ${event === 'transcript.data' ? '✓ FINAL' : '~ PARTIAL'}: "${text.substring(0, 80)}..." (${participantName})`);
+
+  // 3. Validate session exists
+  if (!botId) {
+    console.warn("[Transcript] No bot ID in webhook");
+    return; // ACK already sent
+  }
+
+  const sessionId = `bot_${botId}`;
+  const session = getSession(sessionId);
+  if (!session) {
+    console.warn(`[Transcript] Session not found: ${sessionId}`);
+    return; // ACK already sent
+  }
+
+  // 4. Filter out bot's own speech
+  const nameStr = participantName.toLowerCase();
+  if (nameStr.includes("bot") || nameStr.includes("ai") || nameStr.includes("alex")) {
+    return; // ACK already sent
+  }
+
+  // 5. Handle partial transcripts (update UI preview, don't process LLM)
+  if (isPartial) {
+    session.lastPartial = text;
+    return; // ACK already sent
+  }
+
+  // 6. DEDUPLICATION: Check if we already processed this event
+  //    Recall.ai may retry webhooks 2-3 times on network failures
+  const dedupKey = createDedupKey(botId, event, text, Date.now());
+  if (isDuplicate(dedupKey)) {
+    console.log(`[Dedup] Ignoring duplicate transcript event`);
+    return; // ACK already sent, don't process again
+  }
+
+  // 7. FINALIZED TRANSCRIPT: Queue async processing
+  //    Must complete webhook handler <2s to prevent Recall.ai retry
+  session.lastText = text;
+  
+  // Debounce: wait 1.8s after transcript for more speech
+  if (session.debounceTimer) clearTimeout(session.debounceTimer);
+  session.debounceTimer = setTimeout(() => {
+    if (!session.done && !session.processing && session.lastText.trim().length >= 4) {
+      console.log(`[Transcript] Queuing LLM for: "${session.lastText.substring(0, 60)}..."`);
+      // Queue processing async (don't block webhook response)
+      queueTranscriptProcessing(sessionId, session, session.lastText);
+    }
+  }, 1800);
+  // NOTE: res.json() already sent above, webhook returns immediately
 });
 
 // =============================================================================
@@ -409,6 +593,7 @@ app.get("/meeting-page", (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="permissions-policy" content="microphone=*; camera=*; speaker-selection=*">
 <title>Interview — ${esc(candidate)}</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -702,6 +887,13 @@ body{
     <div class="mic-text" id="micText">Waiting for speech...</div>
   </div>
 
+  <!-- Manual test input (hidden, shows if WebSocket fails) -->
+  <div id="testInputContainer" style="display:none; margin-top:12px; width:100%; gap:8px; display:flex;">
+    <input type="text" id="testInput" placeholder="Test: Type your response..." 
+           style="flex:1; padding:10px; border:1px solid #e2e8f0; border-radius:8px; font-size:13px;">
+    <button id="testSubmit" style="padding:10px 16px; background:#818cf8; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:13px;">Send</button>
+  </div>
+
 </div>
 
 <!-- Complete overlay -->
@@ -819,9 +1011,20 @@ body{
     setMode('speaking', 'Alex is speaking...', '');
     var b64 = audioQueue.shift();
     var audio = new Audio('data:audio/mpeg;base64,' + b64);
+    audio.autoplay = true;
+    audio.controls = false;
     audio.onended = playNext;
-    audio.onerror = function() { playNext(); };
-    audio.play().catch(function() { playNext(); });
+    audio.onerror = function(e) {
+      console.error('[Audio] Playback error:', e);
+      playNext();
+    };
+    audio.play().catch(function(err) {
+      console.warn('[Audio] Autoplay blocked, retrying...', err.message);
+      // Retry after user interaction
+      setTimeout(function() {
+        audio.play().catch(function() { playNext(); });
+      }, 500);
+    });
   }
 
   // ── Silence nudge ──────────────────────────────────────
@@ -980,58 +1183,73 @@ body{
     }, SILENCE_MS);
   }
 
-  // ── Recall.ai transcript WebSocket ─────────────────────
-  // Available inside bot's Output Media browser context.
-  // Endpoint: wss://meeting-data.bot.recall.ai/api/v1/transcript
-  // Retry: 30 attempts, 3s fixed delay (Recall.ai recommendation)
-  // Keep-alive: ping every 30s
-  var wsRetries = 0, MAX_WS = 30, pingInterval = null;
-
-  function connectTranscriptWS() {
-    var url = 'wss://meeting-data.bot.recall.ai/api/v1/transcript';
-    try {
-      console.log('[WS] Connect attempt ' + (wsRetries + 1));
-      var ws = new WebSocket(url);
-
-      ws.onopen = function() {
-        console.log('[WS] Connected');
-        wsRetries = 0;
-        setMic('Listening for speech...', false);
-        addBubble('sys', 'Live transcript connected');
-        clearInterval(pingInterval);
-        pingInterval = setInterval(function() {
-          if (ws.readyState === 1) ws.send('{"type":"ping"}');
-        }, 30000);
-      };
-
-      ws.onmessage = function(e) {
-        try { onTranscriptEvent(JSON.parse(e.data)); }
-        catch(err) { console.warn('[WS] Parse:', err.message); }
-      };
-
-      ws.onclose = function() {
-        clearInterval(pingInterval);
-        wsRetries++;
-        if (wsRetries <= MAX_WS && !interviewDone) {
-          setTimeout(connectTranscriptWS, 3000);
-        } else if (!interviewDone) {
-          setMic('Transcript stream disconnected', false);
-        }
-      };
-
-      ws.onerror = function() {};
-    } catch(e) {
-      wsRetries++;
-      if (wsRetries <= MAX_WS) setTimeout(connectTranscriptWS, 3000);
+  // ── Recall.ai transcript webhook handler ─────────────────
+  // Recall.ai sends real-time transcript to /webhook/recall/transcript
+  // This function is called when manual test input is used instead
+  
+  // In production with Recall.ai:
+  //   - Bot joins meeting
+  //   - Recall.ai detects speech
+  //   - Sends transcript.data webhook to /webhook/recall/transcript
+  //   - Server processes and calls LLM
+  //   - Audio response queued automatically
+  //
+  // For testing (without real meeting):
+  //   - Manual input form visible
+  //   - User types response
+  //   - Simulates /api/respond
+  
+  // ── Init ───────────────────────────────────────────────
+  function requestMicrophonePermission() {
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        .then(function(stream) {
+          console.log('[Permissions] Microphone access granted');
+          // Stop the stream immediately (we're just requesting permission)
+          stream.getTracks().forEach(function(track) { track.stop(); });
+          addBubble('sys', 'Microphone access enabled');
+        })
+        .catch(function(err) {
+          console.warn('[Permissions] Microphone access denied:', err.message);
+          // Don't fail - bot can still work via Recall.ai transcript
+          addBubble('sys', 'Note: Microphone permission was denied (not required for this bot)');
+        });
     }
   }
 
-  // ── Init ───────────────────────────────────────────────
+  function setupTestInput() {
+    var testInput = document.getElementById('testInput');
+    var testSubmit = document.getElementById('testSubmit');
+    
+    if (!testInput || !testSubmit) return;
+
+    testSubmit.onclick = function() {
+      var text = testInput.value.trim();
+      if (text.length >= 4 && !busy && !playing && !interviewDone) {
+        apiRespond(text);
+        testInput.value = '';
+      }
+    };
+
+    testInput.onkeypress = function(e) {
+      if (e.key === 'Enter') {
+        var text = testInput.value.trim();
+        if (text.length >= 4 && !busy && !playing && !interviewDone) {
+          apiRespond(text);
+          testInput.value = '';
+        }
+      }
+    };
+  }
+
   window.addEventListener('load', function() {
     addBubble('sys', 'Connecting to interview server...');
+    setupTestInput();
+    requestMicrophonePermission();
     apiStart();
-    // Delay WS — bot needs ~2s to fully initialize in meeting
-    setTimeout(connectTranscriptWS, 2500);
+    addBubble('sys', 'Waiting for candidate speech or manual input...');
+    // In production: Recall.ai sends transcript to /webhook/recall/transcript
+    // For testing: Use manual input field below
   });
 })();
 </script>
@@ -1060,6 +1278,17 @@ server.listen(PORT, () => {
   console.log(`   POST /api/batch-schedule — schedule multiple interviews`);
   console.log(`   GET  /api/report/:id     — get interview report`);
   console.log(`   GET  /health             — health check\n`);
+});
+
+// Handle listen errors (e.g., port already in use)
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ ERROR: Port ${PORT} is already in use. Is another instance running?`);
+    console.error(`   Kill with: lsof -ti:${PORT} | xargs kill -9  (or use 'taskkill /pid <pid> /f' on Windows)`);
+  } else {
+    console.error(`❌ Server error:`, err.message);
+  }
+  process.exit(1);
 });
 
 export { app, server };

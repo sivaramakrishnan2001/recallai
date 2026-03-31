@@ -517,12 +517,12 @@ test("non-zero scores are recorded", () => {
   clean("sc-2");
 });
 
-test("report shows N/A for untested dimensions", () => {
+test("report shows null for untested dimensions", () => {
   const s = makeSession("sc-3");
   recordScores(s, { communication: 8, technicalKnowledge: 0, problemSolving: 0, practicalExperience: 0 });
   const r = generateReport(s);
-  assert.equal(r.technical_score, "N/A");
-  assert.equal(r.communication_score, "8/10");
+  assert.equal(r.technical_score, null);
+  assert.equal(r.communication_score, 8);
   clean("sc-3");
 });
 
