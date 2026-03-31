@@ -2,19 +2,18 @@
 
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 
-const AWS_REGION = process.env.AWS_REGION || "us-east-1";
-const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20241022-v2:0";
-
 let bedrockClient = null;
 
 export async function getBedrockClient() {
   if (!bedrockClient) {
+    const AWS_REGION = process.env.AWS_REGION || "us-east-1";
     bedrockClient = new BedrockRuntimeClient({ region: AWS_REGION });
   }
   return bedrockClient;
 }
 
 export async function callBedrock(messages, systemPrompt, maxTokens = 500) {
+  const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "anthropic.claude-3-5-sonnet-20241022-v2:0";
   const client = await getBedrockClient();
 
   // Bedrock requires first message to be user role

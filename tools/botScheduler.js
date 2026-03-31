@@ -1,12 +1,6 @@
 // Bot Scheduler — Create & schedule Recall.ai bots for automated AI interviews
 // Docs: https://docs.recall.ai/docs/creating-and-scheduling-bots
 
-import dotenv from "dotenv";
-dotenv.config();
-
-const RECALL_REGION = process.env.RECALL_REGION || "ap-northeast-1";
-const RECALL_API    = `https://${RECALL_REGION}.recall.ai/api/v1`;
-
 /**
  * Schedule an AI interview bot to auto-join a meeting.
  *
@@ -23,6 +17,9 @@ const RECALL_API    = `https://${RECALL_REGION}.recall.ai/api/v1`;
  * @returns {Promise<{success, bot_id, joined_at, meeting_url, candidate_name, role, interview_config}>}
  */
 export async function scheduleInterviewBot(config) {
+  const RECALL_REGION = process.env.RECALL_REGION || "ap-northeast-1";
+  const RECALL_API    = `https://${RECALL_REGION}.recall.ai/api/v1`;
+
   const {
     candidate_name,
     role,

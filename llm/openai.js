@@ -1,9 +1,9 @@
 // OpenAI GPT-4o Integration
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
 export async function callOpenAI(messages, systemPrompt, maxTokens = 500) {
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+  const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  
   if (!OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is not set");
   }

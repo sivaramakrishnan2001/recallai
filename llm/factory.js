@@ -5,10 +5,10 @@ import { callOpenAI } from "./openai.js";
 import { callBedrock, getBedrockClient } from "./bedrock.js";
 import { callFallback } from "./fallback.js";
 
-const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
 let cachedCallable = null; // Cache the provider function for performance
 
 export async function initializeProvider() {
+  const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
   if (LLM_PROVIDER === "bedrock") {
     await getBedrockClient();
   }
@@ -17,6 +17,7 @@ export async function initializeProvider() {
 }
 
 function selectProvider() {
+  const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
   if (LLM_PROVIDER === "bedrock") {
     cachedCallable = callBedrock;
   } else if (LLM_PROVIDER === "openai") {
@@ -41,5 +42,6 @@ export async function callLLM(messages, systemPrompt, maxTokens = 500) {
 }
 
 export function getActiveProvider() {
+  const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
   return LLM_PROVIDER;
 }

@@ -1,20 +1,19 @@
 // Text-to-Speech — ElevenLabs Integration
 // Uses eleven_turbo_v2_5 for low latency (ideal for real-time interview audio)
 
-const ELEVENLABS_KEY   = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
-
-// eleven_turbo_v2_5 = lowest latency, high quality English
-// eleven_multilingual_v2 = best quality if multilingual needed
-const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
-
 export async function textToSpeech(text) {
+  // Read environment variables dynamically (after dotenv.config() loads them)
+  const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
+  const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+  const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
+
   if (!text || !text.trim()) return null;
 
-  // Fallback: return null so the meeting page falls back to browser TTS
+  // Require API key for TTS
   if (!ELEVENLABS_KEY) {
-    console.warn("[TTS] ELEVENLABS_API_KEY not set — audio disabled");
-    return null;
+    const error = new Error("ELEVENLABS_API_KEY not configured. Cannot generate audio. Please set ELEVENLABS_API_KEY in .env");
+    error.code = "MISSING_ELEVENLABS_KEY";
+    throw error;
   }
 
   const clean = text.replace(/\[META\].*$/ims, "").trim();
@@ -34,9 +33,9 @@ export async function textToSpeech(text) {
           text: clean,
           model_id: MODEL_ID,
           voice_settings: {
-            stability:        0.4,   // Lower = more expressive (good for interviews)
+            stability:        0.4,
             similarity_boost: 0.8,
-            style:            0.2,   // Slight style for natural delivery
+            style:            0.2,
             use_speaker_boost: true,
           },
         }),
@@ -46,7 +45,7 @@ export async function textToSpeech(text) {
     if (!response.ok) {
       const err = await response.text();
       console.error(`[TTS] ${response.status}: ${err.substring(0, 200)}`);
-      return null;
+      throw new Error(`ElevenLabs API error: ${response.status}`);
     }
 
     const buffer = await response.arrayBuffer();
@@ -54,6 +53,6 @@ export async function textToSpeech(text) {
     return Buffer.from(buffer).toString("base64");
   } catch (err) {
     console.error(`[TTS] Error: ${err.message}`);
-    return null;
+    throw err; // Propagate the error instead of silently returning null
   }
 }

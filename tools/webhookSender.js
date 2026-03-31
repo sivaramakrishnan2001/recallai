@@ -2,9 +2,8 @@
 
 import { generateReport } from "./evaluator.js";
 
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
-
 export async function sendResultsToN8n(session) {
+  const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
   if (!N8N_WEBHOOK_URL) return;
 
   try {
