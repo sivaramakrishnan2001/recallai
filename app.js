@@ -529,21 +529,80 @@ app.get("/meeting-page", (req, res) => {
   }
 
   // ── Recall.ai transcript WebSocket ────────────────────
+  // Connect to the Recall.ai meeting transcript stream.
   // This WebSocket is available inside the bot's browser context.
+  let wsRetries = 0;
+  const MAX_WS_RETRIES = 10;
+  
   function connectTranscriptWS() {
-    const ws = new WebSocket('wss://meeting-data.bot.recall.ai/api/v1/transcript');
-    ws.onopen    = () => { console.log('[WS] Transcript connected'); };
-    ws.onmessage = (e) => {
-      try { onTranscriptEvent(JSON.parse(e.data)); } catch(_) {}
-    };
-    ws.onclose   = () => { setTimeout(connectTranscriptWS, 3000); };
-    ws.onerror   = (e) => { console.error('[WS] Error', e); };
+    // Try multiple endpoints with fallback strategy
+    const endpoints = [
+      'wss://meeting-data.bot.recall.ai/api/v1/transcript',  // Standard endpoint
+      'wss://internal.recall.ai/v1/meeting/transcript',       // Alternative endpoint
+      'wss://ws.recall.ai/transcript',                        // Backup endpoint
+    ];
+    
+    const endpoint = endpoints[Math.min(wsRetries, endpoints.length - 1)];
+    
+    try {
+      console.log('[WS] Attempting connection to ' + endpoint);
+      const ws = new WebSocket(endpoint);
+      
+      ws.onopen = () => {
+        console.log('[WS] ✓ Transcript WebSocket connected');
+        wsRetries = 0; // Reset retries on success
+        setStatus('green','Listening…');
+      };
+      
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          onTranscriptEvent(data);
+        } catch(err) {
+          console.warn('[WS] Parse error:', err.message);
+        }
+      };
+      
+      ws.onclose = () => {
+        console.log('[WS] Connection closed, retrying…');
+        ws.cleaned = true;
+        // Exponential backoff: 1s, 2s, 4s, 8s, etc.
+        const delay = Math.min(1000 * Math.pow(2, wsRetries), 30000);
+        wsRetries++;
+        if (wsRetries <= MAX_WS_RETRIES) {
+          setTimeout(connectTranscriptWS, delay);
+        } else {
+          console.error('[WS] Max retries exceeded. Manual transcript submission recommended.');
+          setStatus('yellow','WebSocket unavailable — manual transcript submission enabled');
+        }
+      };
+      
+      ws.onerror = (e) => {
+        console.error('[WS] Connection error:', e.message || e);
+        if (!ws.cleaned) ws.close();
+      };
+    } catch(e) {
+      console.error('[WS] Failed to create WebSocket:', e.message);
+      const delay = Math.min(1000 * Math.pow(2, wsRetries), 30000);
+      wsRetries++;
+      if (wsRetries <= MAX_WS_RETRIES) {
+        setTimeout(connectTranscriptWS, delay);
+      }
+    }
   }
 
   // ── Init ───────────────────────────────────────────────
   window.addEventListener('load', async () => {
+    console.log('[Init] Starting interview...');
     await apiStart();
-    connectTranscriptWS();
+    
+    // Delay WebSocket connection to allow bot initialization
+    // Recall.ai bot may take 1-2 seconds to fully initialize
+    console.log('[Init] Waiting for bot context to initialize...');
+    setTimeout(() => {
+      console.log('[Init] Connecting to transcript stream...');
+      connectTranscriptWS();
+    }, 2000); // 2 second delay for bot initialization
   });
 })();
 </script>
