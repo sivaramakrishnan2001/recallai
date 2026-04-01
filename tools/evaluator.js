@@ -1,6 +1,10 @@
-// Answer Evaluator — Parse LLM responses, extract scores, generate reports
+// Answer Evaluator — Process tool calls, record scores, generate reports
+// Works with OpenAI Realtime API tool calling (primary) and [META] tags (legacy fallback)
 
-// Improved regex that handles special characters in question field
+import { advancePhase } from "../agent/stateMachine.js";
+import { PHASE } from "../sessions/sessionManager.js";
+
+// Legacy regex for backward compatibility with non-Realtime API paths
 const META_REGEX = /\[META\]\s*phase:(\w+)\s+action:(\w+)\s+comm:(\d+)\s+tech:(\d+)\s+solve:(\d+)\s+exp:(\d+)\s+question:(.*?)(?:\n|$)/i;
 
 function calculateAllScoreAverages(scores) {
@@ -18,7 +22,70 @@ function calculateAllScoreAverages(scores) {
 }
 
 /**
- * Parse LLM Response — Uses pre-compiled regex for performance
+ * Process a tool call from OpenAI Realtime API
+ * @param {Object} session - Interview session
+ * @param {string} toolName - Name of the tool called
+ * @param {Object} args - Tool call arguments
+ * @returns {Object} Result to send back to OpenAI
+ */
+export function processToolCall(session, toolName, args) {
+  switch (toolName) {
+    case "evaluate_response": {
+      const scores = {
+        communication:      Math.min(10, Math.max(0, args.communication || 0)),
+        technicalKnowledge: Math.min(10, Math.max(0, args.technical_knowledge || 0)),
+        problemSolving:     Math.min(10, Math.max(0, args.problem_solving || 0)),
+        practicalExperience: Math.min(10, Math.max(0, args.practical_experience || 0)),
+      };
+
+      // Record non-zero scores
+      if (scores.communication > 0 || scores.technicalKnowledge > 0 ||
+          scores.problemSolving > 0 || scores.practicalExperience > 0) {
+        recordScores(session, scores);
+      }
+
+      // Track question for dedup
+      if (args.question_asked) {
+        session.questionsAsked.push(args.question_asked);
+      }
+
+      // Advance state machine (new question asked)
+      advancePhase(session, "ask");
+
+      console.log(`[Eval] Scores recorded — comm:${scores.communication} tech:${scores.technicalKnowledge} solve:${scores.problemSolving} exp:${scores.practicalExperience}`);
+      return { status: "recorded", phase: session.phase };
+    }
+
+    case "transition_phase": {
+      const nextPhase = args.next_phase;
+      const validPhases = Object.values(PHASE);
+
+      if (!validPhases.includes(nextPhase)) {
+        console.warn(`[Eval] Invalid phase transition: "${nextPhase}"`);
+        return { status: "error", message: `Invalid phase: ${nextPhase}` };
+      }
+
+      console.log(`[Eval] Phase transition: ${session.phase} -> ${nextPhase} (${args.reason || "no reason"})`);
+      advancePhase(session, "transition");
+
+      return { status: "transitioned", phase: session.phase };
+    }
+
+    case "end_interview": {
+      console.log(`[Eval] Interview ended: ${args.reason || "no reason"}`);
+      session.phase = PHASE.DONE;
+      session.done = true;
+      return { status: "ended", phase: PHASE.DONE };
+    }
+
+    default:
+      console.warn(`[Eval] Unknown tool: "${toolName}"`);
+      return { status: "error", message: `Unknown tool: ${toolName}` };
+  }
+}
+
+/**
+ * Parse LLM Response — Legacy [META] tag parser (backward compatibility)
  */
 export function parseLLMResponse(raw) {
   const metaMatch = raw.match(META_REGEX);
@@ -51,11 +118,10 @@ export function parseLLMResponse(raw) {
 }
 
 /**
- * Record scores — Optimized to only add non-zero values
+ * Record scores — Only adds non-zero values
  */
 export function recordScores(session, scores) {
   const scoreKeys = ["communication", "technicalKnowledge", "problemSolving", "practicalExperience"];
-  
   for (const key of scoreKeys) {
     if (scores[key] > 0) {
       session.scores[key].push(scores[key]);
@@ -64,7 +130,7 @@ export function recordScores(session, scores) {
 }
 
 /**
- * Calculate average — Uses pre-optimized stats calculation
+ * Calculate average
  */
 export function avg(arr) {
   if (arr.length === 0) return 0;
@@ -72,53 +138,35 @@ export function avg(arr) {
 }
 
 /**
- * Generate Report — Optimized to calculate all averages in one pass
- * Applies proper weighting: Technical(40%) + Communication(20%) + Experience(20%) + ProblemSolving(20%)
+ * Generate Report — Weighted scoring
+ * Technical(40%) + Communication(20%) + Experience(20%) + ProblemSolving(20%)
  */
 export function generateReport(session) {
-  // Calculate all score averages efficiently
   const stats = calculateAllScoreAverages(session.scores);
-  
-  const commScore = stats.communication.avg;
-  const techScore = stats.technicalKnowledge.avg;
-  const solveScore = stats.problemSolving.avg;
-  const expScore = stats.practicalExperience.avg;
 
-  // Calculate weighted overall score
-  // Only include dimensions that were actually tested (have scores)
+  const commScore  = stats.communication.avg;
+  const techScore  = stats.technicalKnowledge.avg;
+  const solveScore = stats.problemSolving.avg;
+  const expScore   = stats.practicalExperience.avg;
+
   let overall = 0;
-  if (stats.communication.count > 0 || stats.technicalKnowledge.count > 0 || 
+  if (stats.communication.count > 0 || stats.technicalKnowledge.count > 0 ||
       stats.problemSolving.count > 0 || stats.practicalExperience.count > 0) {
-    
-    // Apply weighted calculation
+
     let weightedSum = 0;
     let totalWeight = 0;
-    
-    if (stats.communication.count > 0) {
-      weightedSum += commScore * 0.20;
-      totalWeight += 0.20;
-    }
-    if (stats.technicalKnowledge.count > 0) {
-      weightedSum += techScore * 0.40;
-      totalWeight += 0.40;
-    }
-    if (stats.problemSolving.count > 0) {
-      weightedSum += solveScore * 0.20;
-      totalWeight += 0.20;
-    }
-    if (stats.practicalExperience.count > 0) {
-      weightedSum += expScore * 0.20;
-      totalWeight += 0.20;
-    }
-    
-    // Normalize to 0-100 scale
+
+    if (stats.communication.count > 0)       { weightedSum += commScore  * 0.20; totalWeight += 0.20; }
+    if (stats.technicalKnowledge.count > 0)   { weightedSum += techScore  * 0.40; totalWeight += 0.40; }
+    if (stats.problemSolving.count > 0)       { weightedSum += solveScore * 0.20; totalWeight += 0.20; }
+    if (stats.practicalExperience.count > 0)  { weightedSum += expScore   * 0.20; totalWeight += 0.20; }
+
     overall = totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 10) / 10 : 0;
   }
 
   const strengths  = [];
   const weaknesses = [];
 
-  // Only report strengths/weaknesses for dimensions that were actually tested
   if (stats.communication.count > 0) {
     if (commScore >= 7) strengths.push("Strong communication skills");
     if (commScore < 5)  weaknesses.push("Communication needs improvement");
@@ -137,21 +185,21 @@ export function generateReport(session) {
   }
 
   return {
-    candidate_name:     session.candidateName,
-    role:               session.role,
-    difficulty:         session.difficulty,
-    interview_type:     session.interviewType,
-    overall_score:      overall,  // Numeric 0–10 (weighted avg of dimension scores)
-    overall_score_str:  `${overall}/10`,
-    technical_score:    stats.technicalKnowledge.count  > 0 ? techScore : null,
-    communication_score: stats.communication.count     > 0 ? commScore : null,
-    problem_solving_score: stats.problemSolving.count  > 0 ? solveScore : null,
-    experience_score:   stats.practicalExperience.count > 0 ? expScore : null,
-    strengths:          strengths.length ? strengths : ["No clear strengths identified"],
-    weaknesses:         weaknesses.length ? weaknesses : ["No clear weaknesses identified"],
-    recommended_hire:   overall >= 6,
-    hiring_decision: overall >= 7.5 ? "STRONG_YES" : overall >= 6 ? "YES" : overall >= 4.5 ? "MAYBE" : "NO",
-    questions_asked:    session.questionsAsked.length,
+    candidate_name:        session.candidateName,
+    role:                  session.role,
+    difficulty:            session.difficulty,
+    interview_type:        session.interviewType,
+    overall_score:         overall,
+    overall_score_str:     `${overall}/10`,
+    technical_score:       stats.technicalKnowledge.count  > 0 ? techScore  : null,
+    communication_score:   stats.communication.count       > 0 ? commScore  : null,
+    problem_solving_score: stats.problemSolving.count      > 0 ? solveScore : null,
+    experience_score:      stats.practicalExperience.count > 0 ? expScore   : null,
+    strengths:             strengths.length  ? strengths  : ["No clear strengths identified"],
+    weaknesses:            weaknesses.length ? weaknesses : ["No clear weaknesses identified"],
+    recommended_hire:      overall >= 6,
+    hiring_decision:       overall >= 7.5 ? "STRONG_YES" : overall >= 6 ? "YES" : overall >= 4.5 ? "MAYBE" : "NO",
+    questions_asked:       session.questionsAsked.length,
     summary: overall >= 7.5
       ? `${session.candidateName} demonstrated strong skills across the board for the ${session.role} role. Recommend proceeding to next round.`
       : overall >= 6
@@ -159,8 +207,8 @@ export function generateReport(session) {
         : overall >= 4.5
           ? `${session.candidateName} showed some potential but has areas for improvement. Consider a follow-up interview.`
           : `${session.candidateName} did not meet the threshold for the ${session.role} role at this time.`,
-    transcript: session.history,
-    timestamp: new Date().toISOString(),
+    transcript:       session.history,
+    timestamp:        new Date().toISOString(),
     duration_minutes: Math.round((Date.now() - session.startTime) / 60000),
   };
 }

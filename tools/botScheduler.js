@@ -67,6 +67,15 @@ export async function scheduleInterviewBot(config) {
     return { success: false, error: "RECALL_API_KEY environment variable not set" };
   }
 
+  // --- Dedup key: prevents duplicate bots on same meeting ---
+  const dedupKey = `${joinTime.toISOString().substring(0, 16)}-${meeting_url}`;
+
+  // --- Pre-computed session ID (predictable, known before bot creation) ---
+  // Uses dedup key hash so the meeting page can connect to the right session.
+  const { createHash } = await import("crypto");
+  const sessionHash = createHash("md5").update(dedupKey).digest("hex").substring(0, 12);
+  const preSessionId = `bot_${sessionHash}`;
+
   // --- Build meeting page URL (served by this server as bot's camera) ---
   const params = new URLSearchParams({
     server:    ngrok_url.replace(/^https?:\/\//, ""),
@@ -74,11 +83,9 @@ export async function scheduleInterviewBot(config) {
     candidate: candidate_name,
     difficulty,
     type:      interview_type,
+    sessionId: preSessionId,
   });
   const meetingPageUrl = `${ngrok_url}/meeting-page?${params}`;
-
-  // --- Dedup key: prevents duplicate bots on same meeting ---
-  const dedupKey = `${joinTime.toISOString().substring(0, 16)}-${meeting_url}`;
 
   // --- Build Recall.ai bot payload ---
   const payload = {
@@ -163,10 +170,12 @@ export async function scheduleInterviewBot(config) {
     return {
       success:          true,
       bot_id:           botId,
+      session_id:       preSessionId,
       joined_at:        joinTime.toISOString(),
       meeting_url,
       candidate_name,
       role,
+      resume,
       interview_config: { interview_type, difficulty },
     };
   } catch (err) {

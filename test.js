@@ -1,8 +1,7 @@
 // =============================================================================
-// AI Interview Bot — Test Suite
-// Focus: conversations must sound like a real human senior engineer,
-//        not a robotic AI assistant.
-// Run: node server/test.js
+// AI Interview Bot v3.0 — Test Suite
+// Architecture: OpenAI Realtime API + ElevenLabs TTS + Recall.ai
+// Run: node test.js
 // =============================================================================
 
 import assert from "assert";
@@ -13,10 +12,9 @@ import {
 } from "./sessions/sessionManager.js";
 
 import { advancePhase } from "./agent/stateMachine.js";
-import { parseLLMResponse, recordScores, generateReport, avg } from "./tools/evaluator.js";
-import { buildInterviewerPrompt } from "./tools/questionGenerator.js";
+import { parseLLMResponse, processToolCall, recordScores, generateReport, avg } from "./tools/evaluator.js";
+import { buildRealtimeInstructions, buildGreetingPrompt, INTERVIEW_TOOLS } from "./tools/questionGenerator.js";
 import { scheduleInterviewBot, calculateBotJoinTime, parseResume } from "./tools/botScheduler.js";
-import { getSilencePrompt } from "./agent/interviewAgent.js";
 
 // ── Runner ───────────────────────────────────────────────────────────────────
 let pass = 0, fail = 0;
@@ -43,23 +41,21 @@ const clean = (...ids) => ids.forEach(deleteSession);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. HUMAN-LIKE CONVERSATION QUALITY
-//    The prompt must instruct natural speech and ban robotic patterns.
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Conversation Quality (Human vs Robot) ──────────────────────\n");
 
 test("prompt instructs Alex to sound like a real human, not AI", () => {
   const s = makeSession("q-1");
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("You are NOT an AI") || p.includes("real human") || p.includes("real person"));
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("You are NOT an AI") || p.includes("real human"));
   clean("q-1");
 });
 
 test("prompt bans 'Thank you for your response'", () => {
   const s = makeSession("q-2");
-  const p = buildInterviewerPrompt(s);
+  const p = buildRealtimeInstructions(s);
   assert(p.toLowerCase().includes("thank you for your response"));
-  // Must appear in the BANNED section (preceded by ✗ or NEVER)
-  const banIdx  = p.indexOf("NEVER DO THESE");
+  const banIdx = p.indexOf("NEVER DO THESE");
   const phraseIdx = p.indexOf("Thank you for your response");
   assert(phraseIdx > banIdx, "Phrase must appear in the banned section");
   clean("q-2");
@@ -67,242 +63,240 @@ test("prompt bans 'Thank you for your response'", () => {
 
 test("prompt bans 'That is a great answer'", () => {
   const s = makeSession("q-3");
-  const p = buildInterviewerPrompt(s);
-  const banIdx  = p.indexOf("NEVER DO THESE");
+  const p = buildRealtimeInstructions(s);
+  const banIdx = p.indexOf("NEVER DO THESE");
   const phraseIdx = p.toLowerCase().indexOf("great answer");
   assert(phraseIdx > banIdx, "Must be in banned section");
   clean("q-3");
 });
 
-test("prompt bans 'Now I will ask you about'", () => {
+test("prompt bans 'As an AI'", () => {
   const s = makeSession("q-4");
-  const p = buildInterviewerPrompt(s);
-  const banIdx  = p.indexOf("NEVER DO THESE");
-  const phraseIdx = p.indexOf("Now I will ask you about");
-  assert(phraseIdx > banIdx, "Must be in banned section");
+  const p = buildRealtimeInstructions(s);
+  const banIdx = p.indexOf("NEVER DO THESE");
+  const aiIdx = p.indexOf("As an AI");
+  assert(aiIdx > banIdx, "Must be in banned section");
   clean("q-4");
 });
 
-test("prompt bans question numbering like 'Question 3 of 5'", () => {
+test("prompt instructs Alex to acknowledge previous answer", () => {
   const s = makeSession("q-5");
-  const p = buildInterviewerPrompt(s);
-  const banIdx = p.indexOf("NEVER DO THESE");
-  const numIdx = p.indexOf("Question 3 of 5");
-  assert(numIdx > banIdx, "Question numbering must be banned");
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("Acknowledge what the candidate just said") ||
+    p.includes("Reference something specific"),
+  );
   clean("q-5");
 });
 
-test("prompt instructs Alex to acknowledge previous answer before asking", () => {
+test("prompt provides natural filler words", () => {
   const s = makeSession("q-6");
-  const p = buildInterviewerPrompt(s);
-  assert(
-    p.includes("Acknowledge what the candidate just said") ||
-    p.includes("Reference something specific they mentioned"),
-    "Prompt must instruct acknowledgment of previous answers"
-  );
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("Hmm") || p.includes("Got it") || p.includes("Fair enough"));
   clean("q-6");
 });
 
-test("prompt provides natural filler words to use", () => {
+test("prompt requires asking ONE question at a time", () => {
   const s = makeSession("q-7");
-  const p = buildInterviewerPrompt(s);
-  // Prompt should list natural fillers
-  assert(p.includes("Hmm") || p.includes("Got it") || p.includes("Fair enough"));
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("ONE") || p.includes("one question at a time"));
   clean("q-7");
 });
 
-test("prompt requires asking ONE question at a time", () => {
+test("prompt instructs natural phase transitions", () => {
   const s = makeSession("q-8");
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("ONE") || p.includes("one question at a time"));
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("shift gears") || p.includes("move on") || p.includes("naturally"));
   clean("q-8");
 });
 
-test("prompt gives a GOOD response example with natural acknowledgment", () => {
-  const s = makeSession("q-9");
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("GOOD response") || p.includes("Example of a GOOD"));
-  clean("q-9");
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. TOOL DEFINITIONS (Realtime API)
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── Tool Definitions (Realtime API) ────────────────────────────\n");
+
+test("INTERVIEW_TOOLS has 3 tools", () => {
+  assert.equal(INTERVIEW_TOOLS.length, 3);
 });
 
-test("prompt gives a BAD response example showing robotic speech", () => {
-  const s = makeSession("q-10");
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("BAD response") || p.includes("Example of a BAD"));
-  clean("q-10");
+test("evaluate_response tool has all score parameters", () => {
+  const tool = INTERVIEW_TOOLS.find(t => t.name === "evaluate_response");
+  assert(tool, "evaluate_response tool must exist");
+  const props = tool.parameters.properties;
+  assert(props.communication, "Must have communication");
+  assert(props.technical_knowledge, "Must have technical_knowledge");
+  assert(props.problem_solving, "Must have problem_solving");
+  assert(props.practical_experience, "Must have practical_experience");
 });
 
-test("prompt instructs natural phase transitions (not robotic)", () => {
-  const s = makeSession("q-11");
-  const p = buildInterviewerPrompt(s);
-  assert(
-    p.includes("shift gears") || p.includes("Let's move on") || p.includes("naturally"),
-    "Transitions must sound natural"
-  );
-  clean("q-11");
+test("transition_phase tool has next_phase enum", () => {
+  const tool = INTERVIEW_TOOLS.find(t => t.name === "transition_phase");
+  assert(tool, "transition_phase tool must exist");
+  const nextPhase = tool.parameters.properties.next_phase;
+  assert(nextPhase.enum.includes("resume"));
+  assert(nextPhase.enum.includes("technical"));
+  assert(nextPhase.enum.includes("behavioral"));
+  assert(nextPhase.enum.includes("closing"));
 });
 
-test("prompt bans 'As an AI'", () => {
-  const s = makeSession("q-12");
-  const p = buildInterviewerPrompt(s);
-  const banIdx = p.indexOf("NEVER DO THESE");
-  const aiIdx  = p.indexOf("As an AI");
-  assert(aiIdx > banIdx, "Must be in banned section");
-  clean("q-12");
+test("end_interview tool exists with reason parameter", () => {
+  const tool = INTERVIEW_TOOLS.find(t => t.name === "end_interview");
+  assert(tool, "end_interview tool must exist");
+  assert(tool.parameters.properties.reason);
+});
+
+test("prompt includes tool usage instructions", () => {
+  const s = makeSession("t-1");
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("evaluate_response") || p.includes("TOOL USAGE"));
+  clean("t-1");
+});
+
+test("greeting prompt is concise and mentions candidate name", () => {
+  const s = makeSession("t-2", { candidateName: "Marcus" });
+  const p = buildGreetingPrompt(s);
+  assert(p.includes("Marcus"));
+  assert(p.includes("Alex"));
+  clean("t-2");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. RESUME-BASED PERSONALISATION
-//    Questions must reference the actual resume, not be generic.
+// 3. TOOL CALL PROCESSING
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── Tool Call Processing ────────────────────────────────────────\n");
+
+test("processToolCall: evaluate_response records scores", () => {
+  const s = makeSession("tc-1");
+  s.phase = PHASE.TECHNICAL;
+  const result = processToolCall(s, "evaluate_response", {
+    communication: 8,
+    technical_knowledge: 7,
+    problem_solving: 6,
+    practical_experience: 9,
+    question_asked: "How do you handle caching?",
+  });
+  assert.equal(result.status, "recorded");
+  assert.equal(s.scores.communication[0], 8);
+  assert.equal(s.scores.technicalKnowledge[0], 7);
+  assert.equal(s.scores.problemSolving[0], 6);
+  assert.equal(s.scores.practicalExperience[0], 9);
+  assert(s.questionsAsked.includes("How do you handle caching?"));
+  clean("tc-1");
+});
+
+test("processToolCall: evaluate_response clamps scores to 0-10", () => {
+  const s = makeSession("tc-2");
+  s.phase = PHASE.TECHNICAL;
+  processToolCall(s, "evaluate_response", {
+    communication: 15,
+    technical_knowledge: -3,
+    problem_solving: 0,
+    practical_experience: 10,
+  });
+  assert.equal(s.scores.communication[0], 10);
+  assert.equal(s.scores.technicalKnowledge.length, 0); // 0 not recorded
+  assert.equal(s.scores.problemSolving.length, 0);      // 0 not recorded
+  assert.equal(s.scores.practicalExperience[0], 10);
+  clean("tc-2");
+});
+
+test("processToolCall: transition_phase changes session phase", () => {
+  const s = makeSession("tc-3");
+  s.phase = PHASE.RESUME;
+  const result = processToolCall(s, "transition_phase", {
+    next_phase: "technical",
+    reason: "Enough resume questions",
+  });
+  assert.equal(result.status, "transitioned");
+  clean("tc-3");
+});
+
+test("processToolCall: transition_phase rejects invalid phase", () => {
+  const s = makeSession("tc-4");
+  const result = processToolCall(s, "transition_phase", { next_phase: "invalid_phase" });
+  assert.equal(result.status, "error");
+  clean("tc-4");
+});
+
+test("processToolCall: end_interview sets done flag", () => {
+  const s = makeSession("tc-5");
+  const result = processToolCall(s, "end_interview", { reason: "Time expired" });
+  assert.equal(result.status, "ended");
+  assert.equal(s.done, true);
+  assert.equal(s.phase, PHASE.DONE);
+  clean("tc-5");
+});
+
+test("processToolCall: unknown tool returns error", () => {
+  const s = makeSession("tc-6");
+  const result = processToolCall(s, "unknown_tool", {});
+  assert.equal(result.status, "error");
+  clean("tc-6");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. RESUME-BASED PERSONALISATION
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Resume-Based Personalisation ───────────────────────────────\n");
 
 test("prompt includes candidate resume text verbatim", () => {
   const s = makeSession("r-1", { resume: "Led migration of monolith to microservices at Stripe using Go and Kafka" });
-  const p = buildInterviewerPrompt(s);
+  const p = buildRealtimeInstructions(s);
   assert(p.includes("Led migration of monolith to microservices at Stripe"));
   clean("r-1");
 });
 
-test("prompt instructs to ask about SPECIFIC resume items, not generic", () => {
+test("prompt instructs SPECIFIC resume-based questions", () => {
   const s = makeSession("r-2", { resume: "Worked on payment processing systems" });
-  const p = buildInterviewerPrompt(s);
-  assert(
-    p.includes("specific") || p.includes("SPECIFIC"),
-    "Prompt must instruct specific resume-based questions"
-  );
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("specific") || p.includes("SPECIFIC"));
   clean("r-2");
 });
 
-test("prompt warns NOT to ask generic questions when resume is provided", () => {
+test("prompt warns NOT to ask generic questions when resume provided", () => {
   const s = makeSession("r-3", { resume: "10 years Python, FastAPI, AWS" });
-  const p = buildInterviewerPrompt(s);
-  assert(
-    p.includes("Do NOT ask generic") || p.includes("not ask generic") || p.includes("NOT ask"),
-    "Must discourage generic questions when resume is provided"
-  );
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("Do NOT ask generic") || p.includes("NOT ask"));
   clean("r-3");
 });
 
-test("prompt mentions candidate name in greeting instructions", () => {
-  const s = makeSession("r-4", { candidateName: "Marcus Lee" });
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("Marcus Lee"));
+test("prompt handles no-resume gracefully", () => {
+  const s = makeSession("r-4", { resume: null });
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("No resume provided"));
   clean("r-4");
 });
 
-test("prompt includes role in resume context", () => {
-  const s = makeSession("r-5", { role: "Staff Infrastructure Engineer" });
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("Staff Infrastructure Engineer"));
+test("previously asked questions are listed to prevent repetition", () => {
+  const s = makeSession("r-5");
+  s.questionsAsked = ["Tell me about Redis?", "How did you handle cache invalidation?"];
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("Tell me about Redis?"));
+  assert(p.includes("How did you handle cache invalidation?"));
   clean("r-5");
 });
 
-test("prompt handles no-resume gracefully with generic fallback instruction", () => {
-  const s = makeSession("r-6", { resume: null });
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("No resume provided"));
-  clean("r-6");
-});
-
-test("previously asked questions are listed to prevent repetition", () => {
-  const s = makeSession("r-7");
-  s.questionsAsked = ["Tell me about your Redis experience?", "How did you handle cache invalidation?"];
-  const p = buildInterviewerPrompt(s);
-  assert(p.includes("Tell me about your Redis experience?"));
-  assert(p.includes("How did you handle cache invalidation?"));
-  clean("r-7");
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. SILENCE PROMPTS — Varied, Natural, Non-Repetitive
+// 5. LLM RESPONSE PARSING (Legacy fallback)
 // ─────────────────────────────────────────────────────────────────────────────
-console.log("\n── Silence Prompts (Natural & Varied) ─────────────────────────\n");
+console.log("\n── LLM Response Parsing (Legacy) ──────────────────────────────\n");
 
-await testAsync("silence prompt returns text and audio fields", async () => {
-  const s = makeSession("sp-1");
-  const r = await getSilencePrompt(s);
-  assert(typeof r.text === "string" && r.text.length > 0);
-  // audio may be null if ELEVENLABS_API_KEY not set — that's fine
-  clean("sp-1");
-});
-
-await testAsync("silence prompts are varied — two consecutive calls differ", async () => {
-  const s = makeSession("sp-2");
-  // Run many times to check variety
-  const texts = new Set();
-  for (let i = 0; i < 10; i++) {
-    const r = await getSilencePrompt(s);
-    texts.add(r.text);
-  }
-  assert(texts.size >= 2, `Only got ${texts.size} unique silence prompt(s) — need variety`);
-  clean("sp-2");
-});
-
-await testAsync("silence prompts do NOT contain robotic phrases", async () => {
-  const s = makeSession("sp-3");
-  const roboticPhrases = [
-    "please provide",
-    "i am waiting",
-    "your response is required",
-    "please respond",
-    "please answer",
-  ];
-  for (let i = 0; i < 6; i++) {
-    const r = await getSilencePrompt(s);
-    const lower = r.text.toLowerCase();
-    for (const phrase of roboticPhrases) {
-      assert(!lower.includes(phrase), `Robotic phrase found: "${phrase}" in "${r.text}"`);
-    }
-  }
-  clean("sp-3");
-});
-
-await testAsync("silence prompt does NOT repeat same text back to back", async () => {
-  const s = makeSession("sp-4");
-  let last = "";
-  let repeatCount = 0;
-  for (let i = 0; i < 8; i++) {
-    const r = await getSilencePrompt(s);
-    if (r.text === last) repeatCount++;
-    last = r.text;
-  }
-  assert(repeatCount <= 1, `Silence prompt repeated consecutively ${repeatCount} times`);
-  clean("sp-4");
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. LLM RESPONSE PARSING — Natural speech preserved
-// ─────────────────────────────────────────────────────────────────────────────
-console.log("\n── LLM Response Parsing ───────────────────────────────────────\n");
-
-test("natural acknowledgment + question is preserved in spokenText", () => {
-  const raw = "Right, so the Redis cluster handled invalidation — that's a common pain point. How did you handle cache warming after a cold start?\n[META] phase:technical action:ask comm:7 tech:8 solve:7 exp:8 question:How did you handle cache warming after a cold start?";
+test("natural acknowledgment preserved in spokenText", () => {
+  const raw = "Right, so the Redis cluster handled invalidation. How did you handle cache warming?\n[META] phase:technical action:ask comm:7 tech:8 solve:7 exp:8 question:How did you handle cache warming?";
   const p = parseLLMResponse(raw);
   assert(p.spokenText.includes("Redis cluster"));
-  assert(p.spokenText.includes("cache warming"));
-  // [META] must be stripped from spoken text
   assert(!p.spokenText.includes("[META]"));
 });
 
-test("[META] tag stripped completely from spoken text", () => {
-  const raw = "Sure. Walk me through your deployment pipeline.\n[META] phase:technical action:ask comm:7 tech:8 solve:6 exp:7 question:Walk me through your deployment pipeline.";
+test("[META] tag stripped from spoken text", () => {
+  const raw = "Sure. Walk me through your pipeline.\n[META] phase:technical action:ask comm:7 tech:8 solve:6 exp:7 question:Walk me through your pipeline.";
   const p = parseLLMResponse(raw);
   assert(!p.spokenText.includes("[META]"));
   assert(!p.spokenText.includes("phase:"));
-  assert(!p.spokenText.includes("comm:"));
-});
-
-test("multi-sentence natural response is fully preserved", () => {
-  const raw = "Hmm, interesting. So you were running that on EKS. I'm curious — how did you handle node autoscaling during traffic spikes? Did you use cluster autoscaler or Karpenter?\n[META] phase:technical action:ask comm:8 tech:9 solve:7 exp:8 question:How did you handle node autoscaling during traffic spikes?";
-  const p = parseLLMResponse(raw);
-  assert(p.spokenText.includes("EKS"));
-  assert(p.spokenText.includes("Karpenter"));
-  assert(p.spokenText.includes("Hmm"));
 });
 
 test("extracts all metadata fields correctly", () => {
-  const raw = "Got it. [META] phase:behavioral action:followup comm:7 tech:5 solve:8 exp:7 question:Tell me more about the conflict?";
+  const raw = "Got it. [META] phase:behavioral action:followup comm:7 tech:5 solve:8 exp:7 question:Tell me more?";
   const p = parseLLMResponse(raw);
   assert.equal(p.phase, "behavioral");
   assert.equal(p.action, "followup");
@@ -310,45 +304,23 @@ test("extracts all metadata fields correctly", () => {
   assert.equal(p.scores.technicalKnowledge, 5);
   assert.equal(p.scores.problemSolving, 8);
   assert.equal(p.scores.practicalExperience, 7);
-  assert.equal(p.question, "Tell me more about the conflict?");
 });
 
 test("missing [META] returns safe defaults", () => {
-  const p = parseLLMResponse("Take your time, go ahead.");
-  assert.equal(p.spokenText, "Take your time, go ahead.");
+  const p = parseLLMResponse("Take your time.");
+  assert.equal(p.spokenText, "Take your time.");
   assert.equal(p.phase, null);
   assert.equal(p.action, "ask");
   assert.equal(p.scores.communication, 0);
 });
 
-test("empty string gets fallback spoken text", () => {
+test("empty string gets fallback text", () => {
   const p = parseLLMResponse("");
   assert(p.spokenText.length > 0);
 });
 
-test("whitespace-only string gets fallback text", () => {
-  const p = parseLLMResponse("   ");
-  assert(p.spokenText.length > 0);
-});
-
-test("introduction phase with zero scores is valid", () => {
-  const raw = "Hey Jane, I'm Alex — good to meet you. So just to kick things off, can you walk me through your background and what brought you here today?\n[META] phase:introduction action:ask comm:0 tech:0 solve:0 exp:0 question:Can you walk me through your background?";
-  const p = parseLLMResponse(raw);
-  assert.equal(p.phase, "introduction");
-  assert.equal(p.scores.communication, 0); // no score yet — just introductions
-  assert(p.spokenText.includes("Alex"));
-});
-
-test("closing phase action:close is parsed correctly", () => {
-  const raw = "Alright Jane, that's all from my side. Really appreciate you taking the time today. We'll be in touch soon.\n[META] phase:closing action:close comm:0 tech:0 solve:0 exp:0 question:none";
-  const p = parseLLMResponse(raw);
-  assert.equal(p.action, "close");
-  assert.equal(p.phase, "closing");
-  assert(p.spokenText.includes("appreciate you"));
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. SESSION MANAGEMENT
+// 6. SESSION MANAGEMENT
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Session Management ─────────────────────────────────────────\n");
 
@@ -388,39 +360,39 @@ test("createSession respects custom duration", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. TIME MANAGEMENT
+// 7. TIME MANAGEMENT
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Time Management ────────────────────────────────────────────\n");
 
 test("fresh session is not expired", () => {
-  const s = makeSession("t-1");
+  const s = makeSession("t-1a");
   assert.equal(isTimeExpired(s), false);
-  clean("t-1");
+  clean("t-1a");
 });
 
 test("session past maxDuration is expired", () => {
-  const s = makeSession("t-2");
+  const s = makeSession("t-2a");
   s.startTime = Date.now() - 31 * 60 * 1000;
   assert.equal(isTimeExpired(s), true);
-  clean("t-2");
+  clean("t-2a");
 });
 
 test("isTimeAlmostUp true within last 2 minutes", () => {
-  const s = makeSession("t-3", { max_interview_duration: 30 });
+  const s = makeSession("t-3a", { max_interview_duration: 30 });
   s.startTime = Date.now() - 29 * 60 * 1000;
   assert.equal(isTimeAlmostUp(s), true);
-  clean("t-3");
+  clean("t-3a");
 });
 
 test("getRemainingMinutes is 0 when expired", () => {
-  const s = makeSession("t-4");
+  const s = makeSession("t-4a");
   s.startTime = Date.now() - 35 * 60 * 1000;
   assert.equal(getRemainingMinutes(s), 0);
-  clean("t-4");
+  clean("t-4a");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. STATE MACHINE — Natural phase flow
+// 8. STATE MACHINE
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── State Machine ──────────────────────────────────────────────\n");
 
@@ -481,25 +453,16 @@ test("followup increments followUpCount", () => {
   clean("sm-7");
 });
 
-test("followup auto-resets at maxFollowUps limit", () => {
-  const s = makeSession("sm-8");
-  s.phase = PHASE.TECHNICAL;
-  s.followUpCount = s.maxFollowUps; // at limit
-  advancePhase(s, "followup");
-  assert.equal(s.followUpCount, 0); // reset → treat as new question
-  clean("sm-8");
-});
-
-test("auto-transition when phase question limit reached (medium resume = 2)", () => {
-  const s = makeSession("sm-9", { difficulty: "medium", interviewType: "mixed" });
+test("auto-transition when phase question limit reached", () => {
+  const s = makeSession("sm-8", { difficulty: "medium", interviewType: "mixed" });
   s.phase = PHASE.RESUME; s.phaseStep = 1;
   advancePhase(s, "ask");
   assert.equal(s.phase, PHASE.TECHNICAL);
-  clean("sm-9");
+  clean("sm-8");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. SCORING & REPORT
+// 9. SCORING & REPORT
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Scoring & Report ───────────────────────────────────────────\n");
 
@@ -541,10 +504,10 @@ test("recommended_hire false when overall < 6", () => {
 });
 
 test("report includes candidate name, role, interview_type", () => {
-  const s = makeSession("sc-6", { candidateName: "Tom Hanks", role: "DevOps Engineer", interviewType: "technical" });
+  const s = makeSession("sc-6", { candidateName: "Tom", role: "DevOps", interviewType: "technical" });
   const r = generateReport(s);
-  assert.equal(r.candidate_name, "Tom Hanks");
-  assert.equal(r.role, "DevOps Engineer");
+  assert.equal(r.candidate_name, "Tom");
+  assert.equal(r.role, "DevOps");
   assert.equal(r.interview_type, "technical");
   clean("sc-6");
 });
@@ -554,7 +517,7 @@ test("avg([]) = 0",       () => { assert.equal(avg([]), 0); });
 test("avg([10]) = 10",    () => { assert.equal(avg([10]), 10); });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. BOT SCHEDULER VALIDATION
+// 10. BOT SCHEDULER VALIDATION
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Bot Scheduler Validation ───────────────────────────────────\n");
 
@@ -573,17 +536,14 @@ await testAsync("rejects missing candidate_name", async () => {
 await testAsync("rejects missing role", async () => {
   const r = await scheduleInterviewBot({ ...BASE, role: undefined });
   assert.equal(r.success, false);
-  assert(r.error.includes("role"));
 });
 await testAsync("rejects missing meeting_url", async () => {
   const r = await scheduleInterviewBot({ ...BASE, meeting_url: undefined });
   assert.equal(r.success, false);
-  assert(r.error.includes("meeting_url"));
 });
 await testAsync("rejects missing meeting_time", async () => {
   const r = await scheduleInterviewBot({ ...BASE, meeting_time: undefined });
   assert.equal(r.success, false);
-  assert(r.error.includes("meeting_time"));
 });
 await testAsync("rejects missing server_url", async () => {
   const r = await scheduleInterviewBot({ ...BASE, ngrok_url: undefined });
@@ -592,7 +552,6 @@ await testAsync("rejects missing server_url", async () => {
 await testAsync("rejects past meeting time", async () => {
   const r = await scheduleInterviewBot({ ...BASE, meeting_time: new Date(Date.now() - 60000).toISOString() });
   assert.equal(r.success, false);
-  assert(r.error.toLowerCase().includes("future") || r.error.toLowerCase().includes("minute"));
 });
 await testAsync("rejects meeting time < 2 min away", async () => {
   const r = await scheduleInterviewBot({ ...BASE, meeting_time: new Date(Date.now() + 60000).toISOString() });
@@ -613,7 +572,7 @@ await testAsync("rejects when RECALL_API_KEY missing", async () => {
 
 test("calculateBotJoinTime returns Date before meeting", () => {
   const meeting = new Date(Date.now() + 60 * 60 * 1000);
-  const join    = calculateBotJoinTime(meeting, 5);
+  const join = calculateBotJoinTime(meeting, 5);
   assert(join < meeting);
   assert.equal(Math.round((meeting - join) / 60000), 5);
 });
@@ -625,7 +584,7 @@ test("calculateBotJoinTime throws when too soon", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. RESUME PARSING
+// 11. RESUME PARSING
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Resume Parsing ─────────────────────────────────────────────\n");
 

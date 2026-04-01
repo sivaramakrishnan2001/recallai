@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "interview-bot",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["C:\\pragmatic\\meeting-bots\\voice-interview-clean\\server\\app.js"],
+      "port": 3000
+    }
+  ]
+}
