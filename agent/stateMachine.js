@@ -14,8 +14,8 @@ export function advancePhase(session, action) {
     if (session.interviewType === "technical" && phaseOrder[nextIdx] === PHASE.BEHAVIORAL) {
       nextIdx++; // skip behavioral
     }
-    if (session.interviewType === "hr" && phaseOrder[nextIdx] === PHASE.TECHNICAL) {
-      nextIdx++; // skip technical
+    if (session.interviewType === "behavioral" && phaseOrder[nextIdx] === PHASE.TECHNICAL) {
+      nextIdx++; // skip technical for behavioral-only interviews
     }
 
     if (nextIdx < phaseOrder.length) {
@@ -53,8 +53,8 @@ export function advancePhase(session, action) {
       if (session.interviewType === "technical" && phaseOrder[nextPhaseIdx] === PHASE.BEHAVIORAL) {
         nextPhaseIdx++;
       }
-      if (session.interviewType === "hr" && phaseOrder[nextPhaseIdx] === PHASE.TECHNICAL) {
-        nextPhaseIdx++;
+      if (session.interviewType === "behavioral" && phaseOrder[nextPhaseIdx] === PHASE.TECHNICAL) {
+        nextPhaseIdx++; // skip technical for behavioral-only interviews
       }
     }
 

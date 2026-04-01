@@ -1,6 +1,7 @@
 # DataAlchemist Interview AI Agent — API Documentation
 
 > **Stack:** Node.js 18+ · Express · OpenAI Realtime API · ElevenLabs TTS · Recall.ai · WebSocket
+> **Version:** 3.1.0
 
 ---
 
@@ -18,6 +19,7 @@
 10. [WebSocket /ws](#10-websocket-ws)
 11. [Error Responses](#11-error-responses)
 12. [Language Support](#12-language-support)
+13. [Changelog](#13-changelog)
 
 ---
 
@@ -94,13 +96,15 @@ Copy `.env.example` to `.env` and fill in the values below.
 | `OPENAI_API_KEY`      | ✅ Yes   | OpenAI API key with Realtime API access (`sk-proj-...`)                     |
 | `ELEVENLABS_API_KEY`  | ✅ Yes   | ElevenLabs API key for TTS (`sk_...`)                                       |
 | `ELEVENLABS_VOICE_ID` | ✅ Yes   | ElevenLabs voice ID. Default: `21m00Tcm4TlvDq8ikWAM` (Rachel)              |
-| `RECALL_API_KEY`      | ✅ Yes   | Recall.ai API key for meeting bot creation                                  |
-| `RECALL_REGION`       | ✅ Yes   | Recall.ai region. E.g. `ap-northeast-1`, `us-east-1`                       |
-| `PORT`                | No       | HTTP port. Defaults to `3000`                                               |
-| `N8N_WEBHOOK_URL`     | No       | n8n webhook to receive completed interview reports                          |
-| `NGROK_AUTHTOKEN`     | No       | ngrok auth token for auto-tunnel setup                                      |
-| `COMPOSIO_API_KEY`    | No       | Composio key for Gmail / Calendar / Slack / Notion integrations             |
-| `COMPOSIO_USER_ID`    | No       | Composio user ID                                                            |
+| `RECALL_API_KEY`          | ✅ Yes   | Recall.ai API key for meeting bot creation                                  |
+| `RECALL_REGION`           | ✅ Yes   | Recall.ai region. E.g. `ap-northeast-1`, `us-east-1`                       |
+| `PORT`                    | No       | HTTP port. Defaults to `3000`                                               |
+| `OPENAI_REALTIME_MODEL`   | No       | OpenAI Realtime model ID. Defaults to `gpt-4o-realtime-preview`            |
+| `ELEVENLABS_MODEL_ID`     | No       | ElevenLabs model. Defaults to `eleven_multilingual_v2`                     |
+| `N8N_WEBHOOK_URL`         | No       | n8n webhook to receive completed interview reports (retries 3×)            |
+| `NGROK_AUTHTOKEN`         | No       | ngrok auth token for auto-tunnel setup                                      |
+| `COMPOSIO_API_KEY`        | No       | Composio key for Gmail / Calendar / Slack / Notion integrations             |
+| `COMPOSIO_USER_ID`        | No       | Composio user ID                                                            |
 
 **Example `.env`:**
 
@@ -417,17 +421,160 @@ https://a1b2c3d4.ngrok-free.app/meeting-page?sessionId=bot_1750420800000&candida
 
 ## 8. POST /webhook/recall/events
 
-Recall.ai lifecycle webhook. Configure this URL in your Recall.ai dashboard under **Bot Webhooks**.
+Recall.ai lifecycle webhook. Configure this URL in your Recall.ai dashboard under **Bot Webhooks → Webhook URL**.
 
 **URL:** `POST /webhook/recall/events`
+**Dashboard setting:** `https://your-server/webhook/recall/events`
 
-### Events Handled
+---
 
-| Event                  | Action                                                                    |
-| :--------------------- | :------------------------------------------------------------------------ |
-| `bot.in_call_recording`| Auto-creates session if not already present using bot metadata            |
-| `bot.call_ended`       | Finalises interview, fetches artifacts, sends report to n8n webhook       |
-| `bot.done`             | Same as `bot.call_ended`                                                  |
+### All Recall.ai Webhook Events
+
+Below is the complete list of events Recall.ai can send. Subscribe to the ones you need in the dashboard.
+
+#### 🤖 Bot Events
+
+| Event                              | Description                                                         | Handled |
+| :--------------------------------- | :------------------------------------------------------------------ | :-----: |
+| `bot.joining_call`                 | Bot is in the process of joining the meeting                        | —       |
+| `bot.in_waiting_room`              | Bot is in the waiting room, not yet admitted                        | —       |
+| `bot.in_call_not_recording`        | Bot joined but recording has not started                            | —       |
+| `bot.in_call_recording`            | Bot is in the call and actively recording — **session auto-created**| ✅      |
+| `bot.recording_permission_allowed` | Host granted recording permission to the bot                        | —       |
+| `bot.recording_permission_denied`  | Host denied recording permission                                    | —       |
+| `bot.call_ended`                   | Call ended — triggers report generation and n8n webhook             | ✅      |
+| `bot.done`                         | Bot fully finished all post-call processing                         | ✅      |
+| `bot.fatal`                        | Bot encountered a fatal error and terminated                        | —       |
+| `bot.breakout_room_entered`        | Bot entered a breakout room                                         | —       |
+| `bot.breakout_room_left`           | Bot left a breakout room                                            | —       |
+| `bot.breakout_room_opened`         | A breakout room was opened in the meeting                           | —       |
+| `bot.breakout_room_closed`         | A breakout room was closed in the meeting                           | —       |
+
+#### 🎙️ Audio Events
+
+| Event                    | Description                                        |
+| :----------------------- | :------------------------------------------------- |
+| `audio_mixed.processing` | Mixed audio artifact is being processed            |
+| `audio_mixed.done`       | Mixed audio artifact is ready                      |
+| `audio_mixed.failed`     | Mixed audio processing failed                      |
+| `audio_mixed.deleted`    | Mixed audio artifact was deleted                   |
+| `audio_separate.processing` | Per-participant audio is being processed        |
+| `audio_separate.done`    | Per-participant audio is ready                     |
+| `audio_separate.failed`  | Per-participant audio processing failed            |
+| `audio_separate.deleted` | Per-participant audio artifact was deleted         |
+
+#### 🎥 Recording Events
+
+| Event                  | Description                                          |
+| :--------------------- | :--------------------------------------------------- |
+| `recording.processing` | Recording is being processed                         |
+| `recording.done`       | Recording is ready for download                      |
+| `recording.failed`     | Recording processing failed                          |
+| `recording.paused`     | Recording was paused                                 |
+| `recording.deleted`    | Recording was deleted                                |
+
+#### 🎞️ Video Events
+
+| Event                     | Description                                       |
+| :------------------------ | :------------------------------------------------ |
+| `video_mixed.processing`  | Mixed video artifact is being processed           |
+| `video_mixed.done`        | Mixed video artifact is ready                     |
+| `video_mixed.failed`      | Mixed video processing failed                     |
+| `video_mixed.deleted`     | Mixed video artifact was deleted                  |
+| `video_separate.processing` | Per-participant video is being processed        |
+| `video_separate.done`     | Per-participant video is ready                    |
+| `video_separate.failed`   | Per-participant video processing failed           |
+| `video_separate.deleted`  | Per-participant video artifact was deleted        |
+
+#### 📝 Transcript Events
+
+| Event                    | Description                                        | Handled |
+| :----------------------- | :------------------------------------------------- | :-----: |
+| `transcript.processing`  | Transcript is being generated                      | —       |
+| `transcript.done`        | Transcript is ready                                | —       |
+| `transcript.failed`      | Transcript generation failed                       | —       |
+| `transcript.deleted`     | Transcript was deleted                             | —       |
+
+#### 🧠 Meeting Metadata Events
+
+| Event                         | Description                                   |
+| :---------------------------- | :-------------------------------------------- |
+| `meeting_metadata.processing` | Meeting metadata is being extracted           |
+| `meeting_metadata.done`       | Meeting metadata extraction complete          |
+| `meeting_metadata.failed`     | Meeting metadata extraction failed            |
+| `meeting_metadata.deleted`    | Meeting metadata was deleted                  |
+
+#### 👥 Participant Events
+
+| Event                          | Description                                  |
+| :----------------------------- | :------------------------------------------- |
+| `participant_events.processing`| Participant event data is being processed    |
+| `participant_events.done`      | Participant event data is ready              |
+| `participant_events.failed`    | Participant event processing failed          |
+| `participant_events.deleted`   | Participant event data was deleted           |
+
+#### ⚡ Realtime Endpoint Events
+
+| Event                       | Description                                     |
+| :-------------------------- | :---------------------------------------------- |
+| `realtime_endpoint.running` | Realtime endpoint is active and receiving data  |
+| `realtime_endpoint.done`    | Realtime endpoint session completed             |
+| `realtime_endpoint.failed`  | Realtime endpoint encountered an error          |
+
+#### ☁️ SDK Upload Events
+
+| Event                    | Description                                        |
+| :----------------------- | :------------------------------------------------- |
+| `sdk_upload.uploading`   | SDK artifact upload in progress                    |
+| `sdk_upload.complete`    | SDK artifact upload completed                      |
+| `sdk_upload.completed`   | Alias for `sdk_upload.complete`                    |
+| `sdk_upload.failed`      | SDK artifact upload failed                         |
+
+#### 📅 Calendar Events
+
+| Event                  | Description                                          |
+| :--------------------- | :--------------------------------------------------- |
+| `calendar.sync_events` | Calendar events synced to Recall.ai                  |
+| `calendar.update`      | Calendar entry was updated                           |
+
+#### 💬 Slack Events
+
+| Event                      | Description                                      |
+| :------------------------- | :------------------------------------------------ |
+| `slack.huddle_state`       | Slack huddle state changed                        |
+| `slack_team.active`        | Slack workspace integration is active             |
+| `slack_team.invited`       | Bot was invited to a Slack workspace              |
+| `slack_team.access_revoked`| Slack workspace access was revoked                |
+
+---
+
+### Events This Server Handles
+
+| Event                  | Action                                                                       |
+| :--------------------- | :--------------------------------------------------------------------------- |
+| `bot.in_call_recording`| Auto-creates interview session from bot metadata if not already present      |
+| `bot.call_ended`       | Finalises session · fetches Recall.ai artifacts · sends report to n8n        |
+| `bot.done`             | Same as `bot.call_ended` — whichever fires first triggers finalisation       |
+
+---
+
+### Example Payload — `bot.joining_call`
+
+```json
+{
+  "event": "bot.joining_call",
+  "data": {
+    "bot": {
+      "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef",
+      "metadata": {
+        "candidate_name": "Priya Sharma",
+        "role": "Senior Backend Engineer",
+        "session_id": "bot_1750420800000"
+      }
+    }
+  }
+}
+```
 
 ### Example Payload — `bot.in_call_recording`
 
@@ -459,8 +606,61 @@ Recall.ai lifecycle webhook. Configure this URL in your Recall.ai dashboard unde
       "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef",
       "metadata": {
         "candidate_name": "Priya Sharma",
-        "role": "Senior Backend Engineer"
+        "role": "Senior Backend Engineer",
+        "session_id": "bot_1750420800000"
       }
+    }
+  }
+}
+```
+
+### Example Payload — `recording.done`
+
+```json
+{
+  "event": "recording.done",
+  "data": {
+    "bot": {
+      "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef"
+    },
+    "recording": {
+      "id": "rec_abc123",
+      "download_url": "https://api.recall.ai/v1/recordings/rec_abc123/download",
+      "expires_at": "2025-06-27T10:00:00.000Z"
+    }
+  }
+}
+```
+
+### Example Payload — `transcript.done`
+
+```json
+{
+  "event": "transcript.done",
+  "data": {
+    "bot": {
+      "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef"
+    },
+    "transcript": {
+      "id": "trs_xyz789",
+      "download_url": "https://api.recall.ai/v1/transcripts/trs_xyz789/download"
+    }
+  }
+}
+```
+
+### Example Payload — `realtime_endpoint.running`
+
+```json
+{
+  "event": "realtime_endpoint.running",
+  "data": {
+    "bot": {
+      "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef"
+    },
+    "realtime_endpoint": {
+      "id": "rte_def456",
+      "url": "wss://your-server/ws?session=bot_1750420800000"
     }
   }
 }
@@ -472,6 +672,8 @@ Recall.ai lifecycle webhook. Configure this URL in your Recall.ai dashboard unde
 { "ok": true }
 ```
 
+> Always respond with `200 { ok: true }` immediately — Recall.ai will retry if it does not receive a timely response. Heavy processing should be done asynchronously (`setImmediate` / worker).
+
 ---
 
 ## 9. POST /webhook/recall/transcript
@@ -479,13 +681,14 @@ Recall.ai lifecycle webhook. Configure this URL in your Recall.ai dashboard unde
 Fallback transcript webhook from Recall.ai. Used when the meeting page's direct microphone capture fails — Recall.ai's own transcription is forwarded into the active OpenAI Realtime session instead.
 
 **URL:** `POST /webhook/recall/transcript`
+**Dashboard setting:** `https://your-server/webhook/recall/transcript`
 
 ### Events Handled
 
 | Event                     | Action                                               |
 | :------------------------ | :--------------------------------------------------- |
-| `transcript.data`         | Finalised text forwarded to OpenAI Realtime session  |
-| `transcript.partial_data` | Ignored (only final transcripts are processed)       |
+| `transcript.data`         | Finalised segment forwarded to OpenAI Realtime API   |
+| `transcript.partial_data` | Ignored — only finalised transcripts are processed   |
 
 ### Example Payload
 
@@ -747,3 +950,23 @@ The AI will conduct the full interview — greetings, questions, follow-ups — 
 |         |                       | `uk-UA` | Ukrainian            |
 
 > **Language switching during interview:** The candidate can switch language mid-interview by saying *"can we speak in Hindi"*, *"switch to Tamil"*, etc. The AI will switch immediately and continue in that language.
+
+---
+
+## 13. Changelog
+
+### v3.1.0 — Bug Fixes
+
+| # | File | Bug | Fix |
+| :- | :--- | :-- | :-- |
+| 1 | `sessions/sessionManager.js` | `done` and `resultsSent` properties missing from session init — could cause undefined behaviour in completion checks | Added `done: false` and `resultsSent: false` to every new session |
+| 2 | `sessions/sessionManager.js` | No validation on `difficulty`, `maxDuration`, or `language` — arbitrary/invalid values accepted silently | Added enum check for difficulty, clamp maxDuration to 5–120 min, validate language against `VALID_LANGUAGES` set |
+| 3 | `sessions/sessionManager.js` | Stray `""` string literal at end of file — syntax noise | Removed |
+| 4 | `sessions/sessionManager.js` | Unused `EventEmitter` import and `eventEmitter` export | Removed |
+| 5 | `agent/stateMachine.js` | `"hr"` interview type used in phase-skip logic — never set by any API, so behavioral phase was never actually skipped | Replaced both occurrences with `"behavioral"` |
+| 6 | `app.js` | Typo in error message: `"Realtime session not a connected"` | Fixed to `"Realtime session not connected"` |
+| 7 | `app.js` | Race condition: `sendResultsToN8n` called from both the WebSocket `onResponseText` path and the Recall.ai `bot.call_ended` webhook — caused duplicate n8n deliveries | Added `resultsSent` boolean guard; first caller wins, second is skipped |
+| 8 | `app.js` | `createSession()` called during WS `init` but never cleaned up if the subsequent `realtimeSession.connect()` threw — orphaned sessions leaked memory | Added `deleteSession(sessionId)` and `activeConnections.delete()` in the catch block |
+| 9 | `voice/tts.js` | Threw on ElevenLabs API errors instead of returning `null` — caused unhandled rejection that crashed the WebSocket audio flow | Changed `throw err` to `return null` for graceful degradation |
+| 10 | `tools/webhookSender.js` | `fetch()` to n8n not checked for `response.ok` — silent failures on HTTP 4xx/5xx | Added `response.ok` check, throws on failure; added 3× retry with exponential back-off |
+| 11 | `realtime/openaiRealtime.js` | Hardcoded model `gpt-4o-realtime-preview-2024-12-17` — breaks when OpenAI retires the preview version | Model now reads from `OPENAI_REALTIME_MODEL` env var, defaults to `gpt-4o-realtime-preview` |

@@ -4,7 +4,8 @@
 
 import WebSocket from "ws";
 
-const REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 const RECONNECT_MAX = 3;
 const RECONNECT_DELAY = 2000;
 

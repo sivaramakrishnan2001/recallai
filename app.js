@@ -140,8 +140,10 @@ wss.on("connection", (ws, req) => {
                 phase: session.phase,
               });
 
-              // Check if interview is done
-              if (session.done) {
+              // Check if interview is done — guard with resultsSent to prevent
+              // duplicate n8n deliveries (WS path + Recall.ai webhook both trigger this)
+              if (session.done && !session.resultsSent) {
+                session.resultsSent = true;
                 await sendResultsToN8n(session);
                 const report = generateReport(session);
                 wsSend(ws, { type: "done", report });
@@ -229,6 +231,11 @@ wss.on("connection", (ws, req) => {
         } catch (err) {
           console.error("[WS] Init error:", err.message);
           wsSend(ws, { type: "error", message: `Failed to start: ${err.message}` });
+          // Clean up orphaned session so it doesn't leak memory
+          if (sessionId) {
+            deleteSession(sessionId);
+            activeConnections.delete(sessionId);
+          }
         }
         break;
       }
@@ -245,7 +252,7 @@ wss.on("connection", (ws, req) => {
       // ── Text input (fallback / testing / Recall.ai transcript) ─
       case "text": {
         if (!realtimeSession?.isConnected) {
-          wsSend(ws, { type: "error", message: "Realtime session not a connected" });
+          wsSend(ws, { type: "error", message: "Realtime session not connected" });
           break;
         }
         if (msg.text?.trim()) {
@@ -450,8 +457,9 @@ app.post("/webhook/recall/events", async (req, res) => {
 
   if (event === "bot.call_ended" || event === "bot.done") {
     const session = getSession(sessionId);
-    if (session && !session.done) {
-      session.done = true;
+    if (session && !session.resultsSent) {
+      session.done        = true;
+      session.resultsSent = true;
       setImmediate(async () => {
         try {
           const artifacts = await retrieveBotArtifacts(botId);

@@ -1,9 +1,14 @@
 // Session Management Module
 // Handles: session creation, lifecycle, GC, and storage
 
-import { EventEmitter } from 'events';
-
-const eventEmitter = new EventEmitter();
+// Valid BCP-47 language codes supported by the interview AI
+const VALID_LANGUAGES = new Set([
+  'en-US','ta-IN','es-ES','fr-FR','de-DE','it-IT','pt-PT','pt-BR',
+  'hi-IN','ja-JP','ko-KR','zh-CN','zh-TW','ar-SA','ru-RU','nl-NL',
+  'pl-PL','tr-TR','vi-VN','th-TH','id-ID','ms-MY','bn-IN','ur-PK',
+  'sv-SE','da-DK','fi-FI','nb-NO','el-GR','he-IL','ro-RO','hu-HU',
+  'cs-CZ','uk-UA','te-IN','kn-IN','ml-IN','mr-IN','gu-IN','pa-IN',
+]);
 
 const PHASE = {
   INTRODUCTION: "introduction",
@@ -32,9 +37,22 @@ export function createSession(id, config) {
     return sessions.get(id);
   }
 
-  const difficulty = config.difficulty || "medium";
+  const difficulty = ["easy", "medium", "hard"].includes(config.difficulty)
+    ? config.difficulty
+    : "medium";
+
   const counts = PHASE_QUESTION_COUNTS[difficulty] || PHASE_QUESTION_COUNTS.medium;
-  const maxDurationMinutes = config.max_interview_duration || config.maxDuration || 30;
+
+  // Clamp maxDuration: minimum 5 minutes, maximum 120 minutes
+  const rawDuration = config.max_interview_duration || config.maxDuration || 30;
+  const maxDurationMinutes = Math.min(120, Math.max(5, Number(rawDuration) || 30));
+
+  // Validate language — fall back to en-US if unknown code provided
+  const rawLang = config.language || 'en-US';
+  const language = VALID_LANGUAGES.has(rawLang) ? rawLang : 'en-US';
+  if (rawLang !== language) {
+    console.warn(`[Session] Unknown language "${rawLang}" — defaulting to en-US`);
+  }
 
   const session = {
     id,
@@ -43,7 +61,7 @@ export function createSession(id, config) {
     resume:         config.resume || null,
     interviewType:  config.interviewType || "mixed",
     difficulty,
-    language:       config.language || 'en-US',
+    language,
     phaseCounts:    counts,
     phase:          PHASE.INTRODUCTION,
     phaseStep:      0,
@@ -57,10 +75,11 @@ export function createSession(id, config) {
       problemSolving: [],
       practicalExperience: [],
     },
-    processing: false,
-    lastText:   "",
-    startTime:  Date.now(),
-    maxDurationMs:  maxDurationMinutes * 60 * 1000,
+    processing:       false,
+    done:             false,   // set true by end_interview tool or close action
+    resultsSent:      false,   // guard against duplicate n8n webhook delivery
+    startTime:        Date.now(),
+    maxDurationMs:    maxDurationMinutes * 60 * 1000,
     timeWarningGiven: false,
   };
 
@@ -163,5 +182,4 @@ export function isTimeExpired(session) {
   return getRemainingTime(session) <= 0;
 }
 
-export { PHASE, PHASE_QUESTION_COUNTS, SESSION_TTL_MS, eventEmitter };
-""
+export { PHASE, PHASE_QUESTION_COUNTS, SESSION_TTL_MS, VALID_LANGUAGES };

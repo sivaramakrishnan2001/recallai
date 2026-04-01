@@ -52,6 +52,6 @@ export async function textToSpeech(text) {
     return Buffer.from(buffer).toString("base64");
   } catch (err) {
     console.error(`[TTS] Error: ${err.message}`);
-    throw err; // Propagate the error instead of silently returning null
+    return null; // Return null so callers continue without audio rather than crashing
   }
 }
