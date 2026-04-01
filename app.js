@@ -513,11 +513,11 @@ app.post("/webhook/recall/transcript", (req, res) => {
 function esc(str) {
   if (!str) return "";
   return str
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/"/g, '\\"')
-    .replace(/`/g, "\\`")
-    .replace(/\$/g, "\\$")
+    .replace(/\/g, "\\")
+    .replace(/'/g, "\'")
+    .replace(/"/g, '\"')
+    .replace(/`/g, "\`")
+    .replace(/\$/g, "\$")
     .replace(/<\/script>/gi, "<\\/script>");
 }
 
@@ -604,19 +604,6 @@ body{
 @keyframes wbar-dance{0%,100%{height:8px}50%{height:calc(8px + var(--h,24px))}}
 .status-label{font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px;text-align:center;min-height:20px}
 .status-sub{font-size:12px;color:var(--text-light);text-align:center;margin-bottom:16px;min-height:18px}
-.transcript-area{
-  width:100%;flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:0 4px;
-  scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.08) transparent;
-}
-.transcript-area::-webkit-scrollbar{width:3px}
-.transcript-area::-webkit-scrollbar-thumb{background:rgba(0,0,0,.08);border-radius:2px}
-.bubble{padding:10px 16px;border-radius:16px;font-size:13px;line-height:1.5;max-width:90%;word-wrap:break-word;animation:bubble-in .25s ease}
-@keyframes bubble-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.bubble.alex{align-self:flex-start;background:var(--white);border:1px solid #e2e8f0;color:var(--text);box-shadow:var(--shadow);border-bottom-left-radius:4px}
-.bubble.alex .who{font-size:10px;font-weight:700;color:var(--accent);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
-.bubble.user{align-self:flex-end;background:linear-gradient(135deg,#818cf8,#a78bfa);color:#fff;border-bottom-right-radius:4px;box-shadow:0 2px 12px rgba(129,140,248,.25)}
-.bubble.user .who{font-size:10px;font-weight:700;color:rgba(255,255,255,.7);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px}
-.bubble.sys{align-self:center;background:transparent;color:var(--text-light);font-size:11px;padding:4px 0}
 .mic-bar{
   width:100%;margin-top:12px;flex-shrink:0;display:flex;align-items:center;gap:10px;
   padding:10px 16px;border-radius:14px;background:var(--white);border:1px solid #e2e8f0;box-shadow:var(--shadow);
@@ -666,7 +653,7 @@ body{
   </div>
   <div class="status-label" id="statusLabel">Connecting...</div>
   <div class="status-sub" id="statusSub">${esc(candidate)} &middot; ${esc(role)}</div>
-  <div class="transcript-area" id="chat"></div>
+  <div style="height: 150px"></div>
   <div class="mic-bar" id="micBar">
     <div class="mic-dot"></div>
     <div class="mic-text" id="micText">Waiting for microphone...</div>
@@ -710,7 +697,6 @@ body{
   var audioContext = null, micStream = null, timerInterval = null;
 
   // ── DOM ────────────────────────────────────────────────
-  var $chat     = document.getElementById('chat');
   var $orbWrap  = document.getElementById('orbWrap');
   var $wave     = document.getElementById('waveform');
   var $label    = document.getElementById('statusLabel');
@@ -749,21 +735,6 @@ body{
     $timer.className = 'timer' + (m >= 25 ? ' expired' : m >= 20 ? ' warning' : '');
   }
 
-  function addBubble(type, text) {
-    var div = document.createElement('div');
-    div.className = 'bubble ' + type;
-    if (type === 'alex') {
-      div.innerHTML = '<div class="who">Alex</div>' + escHtml(text);
-    } else if (type === 'user') {
-      div.innerHTML = '<div class="who">' + escHtml(CFG.candidate) + '</div>' + escHtml(text);
-    } else {
-      div.className = 'bubble sys';
-      div.textContent = text;
-    }
-    $chat.appendChild(div);
-    $chat.scrollTop = $chat.scrollHeight;
-  }
-
   function escHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
   function setMic(text, active) {
@@ -772,8 +743,7 @@ body{
   }
 
   // ── Audio Playback Queue ───────────────────────────────
-  function enqueueAudio(b64, text) {
-    if (text) addBubble('alex', text);
+  function enqueueAudio(b64) {
     if (!b64) { if (!audioQueue.length) playing = false; return; }
     audioQueue.push(b64);
     if (!playing) playNext();
@@ -790,7 +760,7 @@ body{
     }
     playing = true;
     micMuted = true; // Mute mic during playback (echo cancellation)
-    setMode('speaking', 'Alex is speaking...', '');
+    setMode('speaking', 'Alex is speaking...', $sub.textContent);
 
     var b64 = audioQueue.shift();
     var audio = new Audio('data:audio/mpeg;base64,' + b64);
@@ -861,8 +831,7 @@ body{
   // ── WebSocket Connection ───────────────────────────────
   function connectWS() {
     setMode('processing', 'Connecting...', 'Establishing real-time connection');
-    addBubble('sys', 'Connecting to interview server...');
-
+    
     ws = new WebSocket(CFG.wsUrl);
 
     ws.onopen = function() {
@@ -887,22 +856,23 @@ body{
           if (!startTime) startTime = Date.now();
           if (!timerInterval) timerInterval = setInterval(updateTimer, 1000);
           setMode('processing', 'Starting interview...', 'AI is preparing');
-          addBubble('sys', 'Connected. Starting interview...');
           // Start audio capture
           startAudioCapture();
           break;
 
         case 'audio':
           if (msg.phase) updatePhase(msg.phase);
-          enqueueAudio(msg.data, msg.text);
+          if (msg.text) $sub.textContent = msg.text;
+          enqueueAudio(msg.data);
           break;
 
         case 'transcript':
           // Show what OpenAI heard from the candidate
           if (!msg.partial && msg.text) {
-            addBubble('user', msg.text);
+            $sub.textContent = msg.text;
             setMic(msg.text, true);
           } else if (msg.partial && msg.text) {
+            $sub.textContent = msg.text + '...';
             setMic(msg.text + '...', true);
           }
           break;
@@ -931,7 +901,6 @@ body{
 
         case 'error':
           console.error('[WS] Server error:', msg.message);
-          addBubble('sys', 'Error: ' + msg.message);
           break;
       }
     };
@@ -939,7 +908,6 @@ body{
     ws.onclose = function() {
       console.log('[WS] Disconnected');
       if (!interviewDone) {
-        addBubble('sys', 'Connection lost. Reconnecting...');
         setTimeout(connectWS, 3000);
       }
     };
@@ -959,7 +927,7 @@ body{
       var text = $input.value.trim();
       if (text.length < 4 || interviewDone || !ws || ws.readyState !== 1) return;
       ws.send(JSON.stringify({ type: 'text', text: text }));
-      addBubble('user', text);
+      $sub.textContent = text;
       $input.value = '';
       setMode('processing', 'Thinking...', '');
     }
