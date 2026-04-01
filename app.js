@@ -41,7 +41,8 @@ import { sendResultsToN8n } from "./tools/webhookSender.js";
 import { textToSpeech } from "./voice/tts.js";
 import { scheduleInterviewBot, batchScheduleInterviews, retrieveBotArtifacts } from "./tools/botScheduler.js";
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
+const HOST = "0.0.0.0";
 
 console.log("\n=== AI Interview Bot v3.0 (Realtime) ===");
 console.log(`OPENAI_API_KEY  : ${process.env.OPENAI_API_KEY ? "set" : "MISSING"}`);
@@ -513,11 +514,11 @@ app.post("/webhook/recall/transcript", (req, res) => {
 function esc(str) {
   if (!str) return "";
   return str
-    .replace(/\/g, "\\")
-    .replace(/'/g, "\'")
-    .replace(/"/g, '\"')
-    .replace(/`/g, "\`")
-    .replace(/\$/g, "\$")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"')
+    .replace(/`/g, "\\`")
+    .replace(/\$/g, "\\$")
     .replace(/<\/script>/gi, "<\\/script>");
 }
 
@@ -955,8 +956,8 @@ app.use((err, req, res, next) => {
 // =============================================================================
 // Start Server
 // =============================================================================
-server.listen(PORT, () => {
-  console.log(`Server: http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Server: http://${HOST}:${PORT}`);
   console.log(`WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`  POST /api/schedule-bot   - schedule bot for meeting`);
   console.log(`  POST /api/batch-schedule - schedule multiple interviews`);

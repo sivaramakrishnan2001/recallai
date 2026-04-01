@@ -5,15 +5,45 @@ import { getRemainingMinutes, isTimeAlmostUp, isTimeExpired } from "../sessions/
 
 export const LANGUAGES = {
   'en-US': 'English',
+  'ta-IN': 'Tamil',
   'es-ES': 'Spanish',
   'fr-FR': 'French',
   'de-DE': 'German',
   'it-IT': 'Italian',
   'pt-PT': 'Portuguese',
+  'pt-BR': 'Portuguese (Brazil)',
   'hi-IN': 'Hindi',
   'ja-JP': 'Japanese',
   'ko-KR': 'Korean',
   'zh-CN': 'Chinese (Simplified)',
+  'zh-TW': 'Chinese (Traditional)',
+  'ar-SA': 'Arabic',
+  'ru-RU': 'Russian',
+  'nl-NL': 'Dutch',
+  'pl-PL': 'Polish',
+  'tr-TR': 'Turkish',
+  'vi-VN': 'Vietnamese',
+  'th-TH': 'Thai',
+  'id-ID': 'Indonesian',
+  'ms-MY': 'Malay',
+  'bn-IN': 'Bengali',
+  'ur-PK': 'Urdu',
+  'sv-SE': 'Swedish',
+  'da-DK': 'Danish',
+  'fi-FI': 'Finnish',
+  'nb-NO': 'Norwegian',
+  'el-GR': 'Greek',
+  'he-IL': 'Hebrew',
+  'ro-RO': 'Romanian',
+  'hu-HU': 'Hungarian',
+  'cs-CZ': 'Czech',
+  'uk-UA': 'Ukrainian',
+  'te-IN': 'Telugu',
+  'kn-IN': 'Kannada',
+  'ml-IN': 'Malayalam',
+  'mr-IN': 'Marathi',
+  'gu-IN': 'Gujarati',
+  'pa-IN': 'Punjabi',
 };
 
 /**
@@ -65,14 +95,14 @@ export const INTERVIEW_TOOLS = [
   },
   {
     name: "change_language",
-    description: "Change the interview language. Use this if the candidate asks to switch languages.",
+    description: "Change the interview language when the candidate requests to speak in a different language. Supports Tamil, Hindi, Arabic, Spanish, French, Chinese, Japanese, Korean, and many more. Call this immediately when the candidate says anything like 'can we speak in Tamil', 'switch to Spanish', 'please use Hindi', etc.",
     parameters: {
       type: "object",
       properties: {
         language: {
           type: "string",
           enum: Object.keys(LANGUAGES),
-          description: "The target language code (e.g., 'es-ES' for Spanish).",
+          description: "The BCP-47 language code of the requested language (e.g., 'ta-IN' for Tamil, 'hi-IN' for Hindi, 'es-ES' for Spanish).",
         },
       },
       required: ["language"],
@@ -156,7 +186,7 @@ ${session.questionsAsked.map((q, i) => `${i + 1}. ${q}`).join("\n") || "(none ye
 
 TOOL USAGE:
 - After every substantive candidate answer, call evaluate_response to silently score them.
-- If the candidate requests to switch languages, call change_language.
+- If the candidate requests to switch languages (including Tamil, Hindi, Arabic, or any supported language), immediately call change_language with the correct language code, then continue the interview fully in that new language.
 - When you've asked enough questions in a phase, call transition_phase.
 - When the interview is over, call end_interview.
 - NEVER mention tools, scoring, or evaluation to the candidate.
