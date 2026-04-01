@@ -44,11 +44,18 @@ import { scheduleInterviewBot, batchScheduleInterviews, retrieveBotArtifacts } f
 const PORT = process.env.PORT || 5000;
 const HOST = "0.0.0.0";
 
+// Public-facing URL — used when building meeting-page links for Recall.ai bots.
+// In Replit, REPLIT_DEV_DOMAIN is the proxied public domain (no port needed).
+const PUBLIC_URL = process.env.REPLIT_DEV_DOMAIN
+  ? `https://${process.env.REPLIT_DEV_DOMAIN}`
+  : `http://localhost:${PORT}`;
+
 console.log("\n=== AI Interview Bot v3.0 (Realtime) ===");
 console.log(`OPENAI_API_KEY  : ${process.env.OPENAI_API_KEY ? "set" : "MISSING"}`);
 console.log(`RECALL_API_KEY  : ${process.env.RECALL_API_KEY ? "set" : "MISSING"}`);
 console.log(`ELEVENLABS_KEY  : ${process.env.ELEVENLABS_API_KEY ? "set" : "MISSING"}`);
 console.log(`N8N_WEBHOOK_URL : ${process.env.N8N_WEBHOOK_URL ? "set" : "not set"}`);
+console.log(`PUBLIC_URL      : ${PUBLIC_URL}`);
 console.log("=========================================\n");
 
 initializeGarbageCollection();
@@ -326,15 +333,18 @@ app.post("/api/schedule-bot", async (req, res) => {
     server_url, interview_type, difficulty,
   } = req.body || {};
 
-  if (!candidate_name || !role || !meeting_url || !meeting_time || !server_url) {
+  if (!candidate_name || !role || !meeting_url || !meeting_time) {
     return res.status(400).json({
-      error: "Required: candidate_name, role, meeting_url, meeting_time, server_url",
+      error: "Required: candidate_name, role, meeting_url, meeting_time",
     });
   }
 
+  // server_url is optional — defaults to this server's public URL
+  const resolvedServerUrl = server_url || PUBLIC_URL;
+
   const result = await scheduleInterviewBot({
     candidate_name, role, resume, meeting_url, meeting_time,
-    interview_type, difficulty, ngrok_url: server_url,
+    interview_type, difficulty, ngrok_url: resolvedServerUrl,
   });
 
   if (!result.success) return res.status(400).json({ error: result.error });
@@ -367,11 +377,12 @@ app.post("/api/schedule-bot", async (req, res) => {
 // =============================================================================
 app.post("/api/batch-schedule", async (req, res) => {
   const { interviews, server_url } = req.body || {};
-  if (!server_url || !Array.isArray(interviews) || interviews.length === 0) {
-    return res.status(400).json({ error: "Required: server_url and interviews[] array" });
+  if (!Array.isArray(interviews) || interviews.length === 0) {
+    return res.status(400).json({ error: "Required: interviews[] array" });
   }
 
-  const configs = interviews.map((i) => ({ ...i, ngrok_url: server_url }));
+  const resolvedServerUrl = server_url || PUBLIC_URL;
+  const configs = interviews.map((i) => ({ ...i, ngrok_url: resolvedServerUrl }));
   const results = await batchScheduleInterviews(configs);
 
   const successful = [];
@@ -495,7 +506,7 @@ app.post("/webhook/recall/transcript", (req, res) => {
 
   // Filter bot's own speech
   const nameStr = (participant.name || "").toLowerCase();
-  if (nameStr.includes("bot") || nameStr.includes("ai") || nameStr.includes("alex")) return;
+  if (nameStr.includes("bot") || nameStr.includes("ai") || nameStr.includes("dataalchemist")) return;
 
   if (isPartial) return; // Only process finalized transcript
 
@@ -523,13 +534,18 @@ function esc(str) {
 }
 
 app.get("/meeting-page", (req, res) => {
-  const serverHost = req.query.server || req.get("host");
+  // Determine the correct public host — never expose 0.0.0.0 to the client.
+  // Priority: ?server query param → x-forwarded-host → host header → PUBLIC_URL fallback.
+  const rawHost    = req.query.server || req.get("x-forwarded-host") || req.get("host") || "";
+  const publicHost = PUBLIC_URL.replace(/^https?:\/\//, "");
+  const serverHost = (rawHost && !rawHost.startsWith("0.0.0.0")) ? rawHost : publicHost;
+
   const role       = req.query.role       || "Software Engineer";
   const candidate  = req.query.candidate  || "Candidate";
   const difficulty = req.query.difficulty  || "medium";
   const type       = req.query.type       || "mixed";
   const sessionId  = req.query.sessionId || "";
-  const proto      = req.get("x-forwarded-proto") || req.protocol || "http";
+  const proto      = req.get("x-forwarded-proto") || req.protocol || "https";
   const wsProto    = proto === "https" ? "wss" : "ws";
   const serverUrl  = `${proto}://${serverHost}`;
   const wsUrl      = `${wsProto}://${serverHost}/ws`;
@@ -557,7 +573,7 @@ body{
 }
 .page{
   width:100%;max-width:480px;display:flex;flex-direction:column;
-  align-items:center;padding:32px 24px;height:100vh;
+  align-items:center;justify-content:center;padding:32px 24px;height:100vh;
 }
 .top-bar{display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:24px}
 .top-left{display:flex;align-items:center;gap:8px}
@@ -619,10 +635,6 @@ body{
 .done-icon svg{width:36px;height:36px;color:#fff}
 .done-card h2{font-size:22px;font-weight:700;margin-bottom:8px;color:var(--text)}
 .done-card p{font-size:14px;color:var(--text-dim);line-height:1.6}
-.test-bar{width:100%;margin-top:8px;display:flex;gap:8px;flex-shrink:0}
-.test-bar input{flex:1;padding:10px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;font-family:var(--font)}
-.test-bar button{padding:10px 16px;background:#818cf8;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px}
-.test-bar button:hover{background:#6366f1}
 </style>
 </head>
 <body>
@@ -651,14 +663,9 @@ body{
   </div>
   <div class="status-label" id="statusLabel">Connecting...</div>
   <div class="status-sub" id="statusSub">${esc(candidate)} &middot; ${esc(role)}</div>
-  <div style="height: 150px"></div>
   <div class="mic-bar" id="micBar">
     <div class="mic-dot"></div>
     <div class="mic-text" id="micText">Waiting for microphone...</div>
-  </div>
-  <div class="test-bar" id="testBar">
-    <input type="text" id="testInput" placeholder="Type a response (testing mode)...">
-    <button id="testSubmit">Send</button>
   </div>
 </div>
 <div class="overlay" id="overlay">
@@ -758,7 +765,7 @@ body{
     }
     playing = true;
     micMuted = true; // Mute mic during playback (echo cancellation)
-    setMode('speaking', 'Alex is speaking...', $sub.textContent);
+    setMode('speaking', 'DataAlchemist is speaking...', $sub.textContent);
 
     var b64 = audioQueue.shift();
     var audio = new Audio('data:audio/mpeg;base64,' + b64);
@@ -915,28 +922,8 @@ body{
     };
   }
 
-  // ── Test Input (fallback when no mic) ──────────────────
-  function setupTestInput() {
-    var $input = document.getElementById('testInput');
-    var $btn = document.getElementById('testSubmit');
-    if (!$input || !$btn) return;
-
-    function sendText() {
-      var text = $input.value.trim();
-      if (text.length < 4 || interviewDone || !ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({ type: 'text', text: text }));
-      $sub.textContent = text;
-      $input.value = '';
-      setMode('processing', 'Thinking...', '');
-    }
-
-    $btn.onclick = sendText;
-    $input.onkeypress = function(e) { if (e.key === 'Enter') sendText(); };
-  }
-
   // ── Init ───────────────────────────────────────────────
   window.addEventListener('load', function() {
-    setupTestInput();
     connectWS();
   });
 })();
@@ -957,8 +944,9 @@ app.use((err, req, res, next) => {
 // Start Server
 // =============================================================================
 server.listen(PORT, HOST, () => {
-  console.log(`Server: http://${HOST}:${PORT}`);
-  console.log(`WebSocket: ws://localhost:${PORT}/ws`);
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Public URL   : ${PUBLIC_URL}`);
+  console.log(`Meeting page : ${PUBLIC_URL}/meeting-page`);
   console.log(`  POST /api/schedule-bot   - schedule bot for meeting`);
   console.log(`  POST /api/batch-schedule - schedule multiple interviews`);
   console.log(`  GET  /api/report/:id     - get interview report`);
