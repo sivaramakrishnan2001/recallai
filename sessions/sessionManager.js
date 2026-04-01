@@ -43,6 +43,7 @@ export function createSession(id, config) {
     resume:         config.resume || null,
     interviewType:  config.interviewType || "mixed",
     difficulty,
+    language:       config.language || 'en-US',
     phaseCounts:    counts,
     phase:          PHASE.INTRODUCTION,
     phaseStep:      0,
@@ -163,3 +164,4 @@ export function isTimeExpired(session) {
 }
 
 export { PHASE, PHASE_QUESTION_COUNTS, SESSION_TTL_MS, eventEmitter };
+""

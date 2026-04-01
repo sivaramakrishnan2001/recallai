@@ -3,6 +3,19 @@
 
 import { getRemainingMinutes, isTimeAlmostUp, isTimeExpired } from "../sessions/sessionManager.js";
 
+export const LANGUAGES = {
+  'en-US': 'English',
+  'es-ES': 'Spanish',
+  'fr-FR': 'French',
+  'de-DE': 'German',
+  'it-IT': 'Italian',
+  'pt-PT': 'Portuguese',
+  'hi-IN': 'Hindi',
+  'ja-JP': 'Japanese',
+  'ko-KR': 'Korean',
+  'zh-CN': 'Chinese (Simplified)',
+};
+
 /**
  * Tool definitions for OpenAI Realtime API function calling.
  * The model calls these tools silently to evaluate, transition phases, and end the interview.
@@ -50,6 +63,21 @@ export const INTERVIEW_TOOLS = [
       required: ["reason"],
     },
   },
+  {
+    name: "change_language",
+    description: "Change the interview language. Use this if the candidate asks to switch languages.",
+    parameters: {
+      type: "object",
+      properties: {
+        language: {
+          type: "string",
+          enum: Object.keys(LANGUAGES),
+          description: "The target language code (e.g., 'es-ES' for Spanish).",
+        },
+      },
+      required: ["language"],
+    },
+  },
 ];
 
 /**
@@ -57,6 +85,8 @@ export const INTERVIEW_TOOLS = [
  * This is sent once at session start and updated when phase/time changes.
  */
 export function buildRealtimeInstructions(session) {
+  const languageName = LANGUAGES[session.language] || 'English';
+
   const resumeBlock = session.resume
     ? `\n\nCANDIDATE RESUME:\n${typeof session.resume === "string" ? session.resume : JSON.stringify(session.resume, null, 2)}\n\nIMPORTANT: Reference specific things from this resume. Ask about real projects, real technologies, and real decisions. Do NOT ask generic questions.`
     : "\n\n(No resume provided — ask about general experience relevant to the role.)";
@@ -76,6 +106,7 @@ CANDIDATE: ${session.candidateName}
 ROLE: ${session.role}
 INTERVIEW TYPE: ${session.interviewType}
 DIFFICULTY: ${session.difficulty}
+LANGUAGE: ${languageName} (${session.language})
 CURRENT PHASE: ${session.phase}
 QUESTIONS ASKED IN THIS PHASE: ${session.phaseStep + 1}
 FOLLOW-UPS SO FAR: ${session.followUpCount}
@@ -125,17 +156,19 @@ ${session.questionsAsked.map((q, i) => `${i + 1}. ${q}`).join("\n") || "(none ye
 
 TOOL USAGE:
 - After every substantive candidate answer, call evaluate_response to silently score them.
+- If the candidate requests to switch languages, call change_language.
 - When you've asked enough questions in a phase, call transition_phase.
 - When the interview is over, call end_interview.
 - NEVER mention tools, scoring, or evaluation to the candidate.
-- Your spoken responses should be natural conversation only.`;
+- Your spoken responses should be in ${languageName} and be natural conversation only.`;
 }
 
 /**
  * Build greeting prompt for the first message
  */
 export function buildGreetingPrompt(session) {
-  return `Start the interview now. Greet ${session.candidateName} warmly as a real human would on a video call. Introduce yourself as Alex. Briefly mention you'll cover ${session.interviewType} topics today. Ask them to walk you through their background. Sound like a real person — casual but professional. Keep it SHORT (2-3 sentences max) since this will be spoken aloud.`;
+  const languageName = LANGUAGES[session.language] || 'English';
+  return `Start the interview now. Greet ${session.candidateName} warmly in ${languageName}. Introduce yourself as Alex. Briefly mention you'll cover ${session.interviewType} topics today. Ask them to walk you through their background. Sound like a real person — casual but professional. Keep it SHORT (2-3 sentences max) since this will be spoken aloud.`;
 }
 
 // Keep backward-compatible export for any code still using this

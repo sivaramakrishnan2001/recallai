@@ -3,6 +3,7 @@
 
 import { advancePhase } from "../agent/stateMachine.js";
 import { PHASE } from "../sessions/sessionManager.js";
+import { LANGUAGES } from "./questionGenerator.js";
 
 // Legacy regex for backward compatibility with non-Realtime API paths
 const META_REGEX = /\[META\]\s*phase:(\w+)\s+action:(\w+)\s+comm:(\d+)\s+tech:(\d+)\s+solve:(\d+)\s+exp:(\d+)\s+question:(.*?)(?:\n|$)/i;
@@ -76,6 +77,18 @@ export function processToolCall(session, toolName, args) {
       session.phase = PHASE.DONE;
       session.done = true;
       return { status: "ended", phase: PHASE.DONE };
+    }
+    
+    case "change_language": {
+      const newLang = args.language;
+      if (LANGUAGES[newLang]) {
+        session.language = newLang;
+        console.log(`[Eval] Language changed to: ${LANGUAGES[newLang]} (${newLang})`);
+        return { status: "language_changed", language: newLang };
+      } else {
+        console.warn(`[Eval] Invalid language code: "${newLang}"`);
+        return { status: "error", message: `Invalid language code: ${newLang}` };
+      }
     }
 
     default:

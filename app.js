@@ -157,8 +157,8 @@ wss.on("connection", (ws, req) => {
               // Notify client of phase changes
               wsSend(ws, { type: "phase", phase: session.phase });
 
-              // Update OpenAI instructions if phase changed
-              if (name === "transition_phase") {
+              // Update OpenAI instructions if phase or language changed
+              if (name === "transition_phase" || name === "change_language") {
                 const updatedInstructions = buildRealtimeInstructions(session);
                 realtimeSession.updateInstructions(updatedInstructions);
               }
@@ -237,7 +237,7 @@ wss.on("connection", (ws, req) => {
       // ── Text input (fallback / testing / Recall.ai transcript) ─
       case "text": {
         if (!realtimeSession?.isConnected) {
-          wsSend(ws, { type: "error", message: "Realtime session not connected" });
+          wsSend(ws, { type: "error", message: "Realtime session not a connected" });
           break;
         }
         if (msg.text?.trim()) {
@@ -597,10 +597,7 @@ body{
 .wbar:nth-child(3){animation-delay:.1s;--h:20px}.wbar:nth-child(4){animation-delay:.15s;--h:36px}
 .wbar:nth-child(5){animation-delay:.2s;--h:24px}.wbar:nth-child(6){animation-delay:.25s;--h:40px}
 .wbar:nth-child(7){animation-delay:.3s;--h:32px}.wbar:nth-child(8){animation-delay:.2s;--h:44px}
-.wbar:nth-child(9){animation-delay:.15s;--h:28px}.wbar:nth-child(10){animation-delay:.1s;--h:36px}
-.wbar:nth-child(11){animation-delay:.05s;--h:20px}.wbar:nth-child(12){animation-delay:.08s;--h:32px}
-.wbar:nth-child(13){animation-delay:.18s;--h:24px}.wbar:nth-child(14){animation-delay:.12s;--h:16px}
-.wbar:nth-child(15){animation-delay:.22s;--h:12px}
+.wbar:nth-child(9){animation-delay:.15s;--h:28px}.wbar:nth-child(10){animation-delay:.1s;--h:36px}.wbar:nth-child(11){animation-delay:.05s;--h:20px}.wbar:nth-child(12){animation-delay:.08s;--h:32px}.wbar:nth-child(13){animation-delay:.18s;--h:24px}.wbar:nth-child(14){animation-delay:.12s;--h:16px}.wbar:nth-child(15){animation-delay:.22s;--h:12px}
 @keyframes wbar-dance{0%,100%{height:8px}50%{height:calc(8px + var(--h,24px))}}
 .status-label{font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px;text-align:center;min-height:20px}
 .status-sub{font-size:12px;color:var(--text-light);text-align:center;margin-bottom:16px;min-height:18px}

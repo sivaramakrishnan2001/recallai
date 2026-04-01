@@ -1,11 +1,11 @@
 // Text-to-Speech — ElevenLabs Integration
-// Uses eleven_turbo_v2_5 for low latency (ideal for real-time interview audio)
+// Uses eleven_multilingual_v2 for multi-language support
 
 export async function textToSpeech(text) {
   // Read environment variables dynamically (after dotenv.config() loads them)
   const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
   const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
-  const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
+  const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
 
   if (!text || !text.trim()) return null;
 
@@ -48,7 +48,7 @@ export async function textToSpeech(text) {
     }
 
     const buffer = await response.arrayBuffer();
-    console.log(`[TTS] Generated ${(buffer.byteLength / 1024).toFixed(1)}KB for: "${clean.substring(0, 60)}…"`);
+    console.log(`[TTS] Generated ${(buffer.byteLength / 1024).toFixed(1)}KB for: \"${clean.substring(0, 60)}…\"`);
     return Buffer.from(buffer).toString("base64");
   } catch (err) {
     console.error(`[TTS] Error: ${err.message}`);
