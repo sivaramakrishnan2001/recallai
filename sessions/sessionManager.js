@@ -19,10 +19,12 @@ const PHASE = {
   DONE:         "done",
 };
 
+// Max 3 questions total across the entire interview.
+// Distribution: 2 resume-anchored + 1 technical/closing = 3.
 const PHASE_QUESTION_COUNTS = {
-  easy:   { resume: 2, technical: 2, behavioral: 1 },
-  medium: { resume: 2, technical: 3, behavioral: 2 },
-  hard:   { resume: 3, technical: 4, behavioral: 2 },
+  easy:   { resume: 2, technical: 1, behavioral: 0 },
+  medium: { resume: 2, technical: 1, behavioral: 0 },
+  hard:   { resume: 2, technical: 1, behavioral: 0 },
 };
 
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;

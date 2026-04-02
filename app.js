@@ -40,6 +40,8 @@ import { processToolCall, generateReport } from "./tools/evaluator.js";
 import { sendResultsToN8n } from "./tools/webhookSender.js";
 import { textToSpeech } from "./voice/tts.js";
 import { scheduleInterviewBot, batchScheduleInterviews, retrieveBotArtifacts } from "./tools/botScheduler.js";
+import { createGoogleMeetSpace } from "./tools/googleMeet.js";
+import { createTeamsMeeting } from "./tools/teamsMeeting.js";
 
 const PORT = process.env.PORT || 5000;
 const HOST = "0.0.0.0";
@@ -51,11 +53,13 @@ const PUBLIC_URL = process.env.REPLIT_DEV_DOMAIN
   : `http://localhost:${PORT}`;
 
 console.log("\n=== AI Interview Bot v3.0 (Realtime) ===");
-console.log(`OPENAI_API_KEY  : ${process.env.OPENAI_API_KEY ? "set" : "MISSING"}`);
-console.log(`RECALL_API_KEY  : ${process.env.RECALL_API_KEY ? "set" : "MISSING"}`);
-console.log(`ELEVENLABS_KEY  : ${process.env.ELEVENLABS_API_KEY ? "set" : "MISSING"}`);
-console.log(`N8N_WEBHOOK_URL : ${process.env.N8N_WEBHOOK_URL ? "set" : "not set"}`);
-console.log(`PUBLIC_URL      : ${PUBLIC_URL}`);
+console.log(`OPENAI_API_KEY        : ${process.env.OPENAI_API_KEY        ? "set" : "MISSING"}`);
+console.log(`RECALL_API_KEY        : ${process.env.RECALL_API_KEY        ? "set" : "MISSING"}`);
+console.log(`ELEVENLABS_KEY        : ${process.env.ELEVENLABS_API_KEY    ? "set" : "MISSING"}`);
+console.log(`GOOGLE_MEET_TOKEN     : ${process.env.GOOGLE_MEET_ACCESS_TOKEN ? "set" : "not set (pass per-request)"}`);
+console.log(`TEAMS_TOKEN           : ${process.env.TEAMS_ACCESS_TOKEN    ? "set" : "not set (pass per-request)"}`);
+console.log(`N8N_WEBHOOK_URL       : ${process.env.N8N_WEBHOOK_URL       ? "set" : "not set"}`);
+console.log(`PUBLIC_URL            : ${PUBLIC_URL}`);
 console.log("=========================================\n");
 
 initializeGarbageCollection();
@@ -335,48 +339,54 @@ app.get("/health", (req, res) => {
 // POST /api/schedule-bot
 // =============================================================================
 app.post("/api/schedule-bot", async (req, res) => {
-  const {
-    candidate_name, role, resume, meeting_url, meeting_time,
-    server_url, interview_type, difficulty,
-  } = req.body || {};
+  try {
+    const {
+      candidate_name, role, resume, meeting_url, meeting_time,
+      server_url, interview_type, difficulty, language,
+    } = req.body || {};
 
-  if (!candidate_name || !role || !meeting_url || !meeting_time) {
-    return res.status(400).json({
-      error: "Required: candidate_name, role, meeting_url, meeting_time",
+    if (!candidate_name || !role || !meeting_url || !meeting_time) {
+      return res.status(400).json({
+        error: "Required: candidate_name, role, meeting_url, meeting_time",
+      });
+    }
+
+    // server_url is optional — defaults to this server's public URL
+    const resolvedServerUrl = server_url || PUBLIC_URL;
+
+    const result = await scheduleInterviewBot({
+      candidate_name, role, resume, meeting_url, meeting_time,
+      interview_type, difficulty, language, ngrok_url: resolvedServerUrl,
     });
+
+    if (!result.success) return res.status(400).json({ error: result.error });
+
+    const sessionId = result.session_id;
+    createSession(sessionId, {
+      candidateName: candidate_name,
+      role,
+      resume,
+      interviewType: interview_type || "mixed",
+      difficulty: difficulty || "medium",
+      language: language || "en-US",
+    });
+
+    // Map botId → sessionId so webhooks can find the session
+    botSessionMap.set(result.bot_id, sessionId);
+
+    console.log(`[schedule-bot] Session ready: ${sessionId} (bot: ${result.bot_id})`);
+    return res.json({
+      success: true,
+      bot_id: result.bot_id,
+      session_id: sessionId,
+      joined_at: result.joined_at,
+      meeting_url: result.meeting_url,
+      message: `Bot scheduled to join at ${new Date(result.joined_at).toLocaleString()}`,
+    });
+  } catch (err) {
+    console.error("[schedule-bot] Unexpected error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
-
-  // server_url is optional — defaults to this server's public URL
-  const resolvedServerUrl = server_url || PUBLIC_URL;
-
-  const result = await scheduleInterviewBot({
-    candidate_name, role, resume, meeting_url, meeting_time,
-    interview_type, difficulty, ngrok_url: resolvedServerUrl,
-  });
-
-  if (!result.success) return res.status(400).json({ error: result.error });
-
-  const sessionId = result.session_id;
-  createSession(sessionId, {
-    candidateName: candidate_name,
-    role,
-    resume,
-    interviewType: interview_type || "mixed",
-    difficulty: difficulty || "medium",
-  });
-
-  // Map botId → sessionId so webhooks can find the session
-  botSessionMap.set(result.bot_id, sessionId);
-
-  console.log(`[schedule-bot] Session ready: ${sessionId} (bot: ${result.bot_id})`);
-  return res.json({
-    success: true,
-    bot_id: result.bot_id,
-    session_id: sessionId,
-    joined_at: result.joined_at,
-    meeting_url: result.meeting_url,
-    message: `Bot scheduled to join at ${new Date(result.joined_at).toLocaleString()}`,
-  });
 });
 
 // =============================================================================
@@ -419,6 +429,197 @@ app.post("/api/batch-schedule", async (req, res) => {
 });
 
 // =============================================================================
+// POST /api/create-google-meet
+// Creates a Google Meet space via the Google Meet REST API.
+// Auth: OAuth 2.0 Bearer token — pass access_token in body or set
+//       GOOGLE_MEET_ACCESS_TOKEN environment variable.
+// Optional: include schedule_bot fields to also schedule a Recall.ai bot.
+// =============================================================================
+app.post("/api/create-google-meet", async (req, res) => {
+  try {
+    const {
+      access_token,
+      access_type,
+      entry_point_access,
+      // Optional: auto-schedule a Recall.ai bot after creating the meeting
+      schedule_bot,
+      candidate_name,
+      role,
+      resume,
+      meeting_time,
+      interview_type,
+      difficulty,
+      language,
+      server_url,
+    } = req.body || {};
+
+    // Step 1 — Create the Google Meet space
+    const meetResult = await createGoogleMeetSpace({
+      access_token,
+      access_type,
+      entry_point_access,
+    });
+
+    if (!meetResult.success) {
+      return res.status(400).json({ error: meetResult.error, details: meetResult.details });
+    }
+
+    const response = {
+      success:      true,
+      platform:     "google_meet",
+      meeting_url:  meetResult.meeting_url,
+      meeting_code: meetResult.meeting_code,
+      space_name:   meetResult.space_name,
+      config:       meetResult.config,
+    };
+
+    // Step 2 (optional) — Schedule a Recall.ai bot to join the meeting
+    if (schedule_bot && candidate_name && role && meeting_time) {
+      const resolvedServerUrl = server_url || PUBLIC_URL;
+      const botResult = await scheduleInterviewBot({
+        candidate_name,
+        role,
+        resume,
+        meeting_url:  meetResult.meeting_url,
+        meeting_time,
+        interview_type,
+        difficulty,
+        language,
+        ngrok_url: resolvedServerUrl,
+      });
+
+      if (botResult.success) {
+        createSession(botResult.session_id, {
+          candidateName: candidate_name,
+          role,
+          resume,
+          interviewType: interview_type || "mixed",
+          difficulty:    difficulty     || "medium",
+          language:      language       || "en-US",
+        });
+        botSessionMap.set(botResult.bot_id, botResult.session_id);
+        response.bot = {
+          bot_id:     botResult.bot_id,
+          session_id: botResult.session_id,
+          joined_at:  botResult.joined_at,
+        };
+        console.log(`[create-google-meet] Bot scheduled: ${botResult.bot_id} → ${meetResult.meeting_url}`);
+      } else {
+        // Meeting was created — include bot error as warning, not a full failure
+        response.bot_warning = `Meeting created but bot scheduling failed: ${botResult.error}`;
+        console.warn("[create-google-meet] Bot scheduling failed:", botResult.error);
+      }
+    }
+
+    console.log(`[create-google-meet] ✓ ${meetResult.meeting_url}`);
+    return res.json(response);
+
+  } catch (err) {
+    console.error("[create-google-meet] Unexpected error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// =============================================================================
+// POST /api/create-teams-meeting
+// Creates a Microsoft Teams online meeting via Microsoft Graph API.
+// Auth: Azure AD / Microsoft Entra ID Bearer token — pass access_token in body
+//       or set TEAMS_ACCESS_TOKEN environment variable.
+// Optional: include schedule_bot fields to also schedule a Recall.ai bot.
+// =============================================================================
+app.post("/api/create-teams-meeting", async (req, res) => {
+  try {
+    const {
+      access_token,
+      subject,
+      start_datetime,
+      end_datetime,
+      lobby_bypass,
+      dial_in_bypass,
+      // Optional: auto-schedule a Recall.ai bot after creating the meeting
+      schedule_bot,
+      candidate_name,
+      role,
+      resume,
+      meeting_time,
+      interview_type,
+      difficulty,
+      language,
+      server_url,
+    } = req.body || {};
+
+    // Step 1 — Create the Teams meeting
+    const teamsResult = await createTeamsMeeting({
+      access_token,
+      subject,
+      start_datetime,
+      end_datetime,
+      lobby_bypass,
+      dial_in_bypass,
+    });
+
+    if (!teamsResult.success) {
+      return res.status(400).json({ error: teamsResult.error, details: teamsResult.details });
+    }
+
+    const response = {
+      success:        true,
+      platform:       "teams",
+      meeting_url:    teamsResult.meeting_url,
+      meeting_id:     teamsResult.meeting_id,
+      subject:        teamsResult.subject,
+      start_datetime: teamsResult.start_datetime,
+      end_datetime:   teamsResult.end_datetime,
+      lobby_bypass_settings: teamsResult.lobby_bypass_settings,
+    };
+
+    // Step 2 (optional) — Schedule a Recall.ai bot to join the meeting
+    if (schedule_bot && candidate_name && role && meeting_time) {
+      const resolvedServerUrl = server_url || PUBLIC_URL;
+      const botResult = await scheduleInterviewBot({
+        candidate_name,
+        role,
+        resume,
+        meeting_url:  teamsResult.meeting_url,
+        meeting_time,
+        interview_type,
+        difficulty,
+        language,
+        ngrok_url: resolvedServerUrl,
+      });
+
+      if (botResult.success) {
+        createSession(botResult.session_id, {
+          candidateName: candidate_name,
+          role,
+          resume,
+          interviewType: interview_type || "mixed",
+          difficulty:    difficulty     || "medium",
+          language:      language       || "en-US",
+        });
+        botSessionMap.set(botResult.bot_id, botResult.session_id);
+        response.bot = {
+          bot_id:     botResult.bot_id,
+          session_id: botResult.session_id,
+          joined_at:  botResult.joined_at,
+        };
+        console.log(`[create-teams-meeting] Bot scheduled: ${botResult.bot_id} → ${teamsResult.meeting_url}`);
+      } else {
+        response.bot_warning = `Meeting created but bot scheduling failed: ${botResult.error}`;
+        console.warn("[create-teams-meeting] Bot scheduling failed:", botResult.error);
+      }
+    }
+
+    console.log(`[create-teams-meeting] ✓ ${teamsResult.meeting_url}`);
+    return res.json(response);
+
+  } catch (err) {
+    console.error("[create-teams-meeting] Unexpected error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// =============================================================================
 // GET /api/report/:sessionId
 // =============================================================================
 app.get("/api/report/:sessionId", (req, res) => {
@@ -439,16 +640,20 @@ app.post("/webhook/recall/events", async (req, res) => {
   console.log(`[Recall webhook] ${event} — bot: ${botId}`);
   if (!botId) return;
 
-  // Resolve botId to sessionId (from schedule-bot mapping, or fallback)
-  const sessionId = botSessionMap.get(botId) || `bot_${botId}`;
+  // Resolve botId → sessionId.
+  // Priority: 1) in-memory botSessionMap (set at schedule time)
+  //           2) session_id stored in bot metadata (survives server restarts)
+  //           3) fallback to bot_<botId> UUID (last resort)
+  const sessionId = botSessionMap.get(botId) || meta.session_id || `bot_${botId}`;
 
   if (event === "bot.in_call_recording") {
     if (!hasSession(sessionId) && meta.candidate_name && meta.role) {
       createSession(sessionId, {
         candidateName: meta.candidate_name,
-        role: meta.role,
+        role:          meta.role,
         interviewType: meta.interview_type || "mixed",
-        difficulty: meta.difficulty || "medium",
+        difficulty:    meta.difficulty     || "medium",
+        language:      meta.language       || "en-US",
       });
       botSessionMap.set(botId, sessionId);
       console.log(`[Recall webhook] Session auto-created: ${sessionId} for bot ${botId}`);
@@ -703,8 +908,8 @@ body{
 
   // ── State ──────────────────────────────────────────────
   var ws = null;
-  var playing = false, interviewDone = false, micMuted = false;
-  var audioQueue = [];
+  var playing = false, interviewDone = false;
+  var audioQueue = [], currentAudio = null;
   var startTime = null;
   var currentPhase = 'introduction';
   var audioContext = null, micStream = null, timerInterval = null;
@@ -762,26 +967,41 @@ body{
     if (!playing) playNext();
   }
 
+  // Stop TTS immediately — used for barge-in when user speaks during playback.
+  // Does NOT send clear_audio so OpenAI keeps the user's speech already buffered.
+  function stopPlayback() {
+    if (currentAudio) {
+      currentAudio.onended = null;
+      currentAudio.onerror = null;
+      currentAudio.pause();
+      currentAudio = null;
+    }
+    audioQueue = [];
+    playing = false;
+  }
+
   function playNext() {
     if (audioQueue.length === 0) {
       playing = false;
-      micMuted = false;
+      currentAudio = null;
       setMode('listening', 'Listening...', CFG.candidate + ' - ' + CFG.role);
-      // Tell server to accept audio again
+      // TTS finished naturally — flush any residual echo from OpenAI's audio buffer
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'clear_audio' }));
       return;
     }
     playing = true;
-    micMuted = true; // Mute mic during playback (echo cancellation)
+    // Mic stays ACTIVE during playback — browser echoCancellation handles feedback.
+    // Audio continues flowing to OpenAI so its VAD can detect user interruptions.
     setMode('speaking', 'DataAlchemist is speaking...', $sub.textContent);
 
     var b64 = audioQueue.shift();
     var audio = new Audio('data:audio/mpeg;base64,' + b64);
-    audio.onended = playNext;
-    audio.onerror = function() { playNext(); };
+    currentAudio = audio;
+    audio.onended = function() { currentAudio = null; playNext(); };
+    audio.onerror = function() { currentAudio = null; playNext(); };
     audio.play().catch(function(err) {
       console.warn('[Audio] Autoplay blocked:', err.message);
-      setTimeout(function() { audio.play().catch(playNext); }, 300);
+      setTimeout(function() { audio.play().catch(function() { currentAudio = null; playNext(); }); }, 300);
     });
   }
 
@@ -805,7 +1025,7 @@ body{
       // Use ScriptProcessorNode (widely supported) for PCM16 capture
       var processor = audioContext.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = function(e) {
-        if (micMuted || interviewDone || !ws || ws.readyState !== 1) return;
+        if (interviewDone || !ws || ws.readyState !== 1) return;
 
         var inputData = e.inputBuffer.getChannelData(0);
 
@@ -900,6 +1120,14 @@ body{
 
         case 'speech_start':
           setMic('Speaking detected...', true);
+          // Barge-in: user started speaking while bot TTS is playing — stop immediately.
+          // Do NOT send clear_audio here — OpenAI's VAD already has the user's speech
+          // buffered and sending clear_audio would erase it.
+          if (playing) {
+            stopPlayback();
+            setMode('listening', 'Listening...', CFG.candidate + ' - ' + CFG.role);
+            console.log('[Barge-in] User interrupted — TTS stopped');
+          }
           break;
 
         case 'speech_stop':
@@ -955,11 +1183,13 @@ server.listen(PORT, HOST, () => {
   console.log(`Server listening on port ${PORT}`);
   console.log(`Public URL   : ${PUBLIC_URL}`);
   console.log(`Meeting page : ${PUBLIC_URL}/meeting-page`);
-  console.log(`  POST /api/schedule-bot   - schedule bot for meeting`);
-  console.log(`  POST /api/batch-schedule - schedule multiple interviews`);
-  console.log(`  GET  /api/report/:id     - get interview report`);
-  console.log(`  GET  /meeting-page       - interview UI`);
-  console.log(`  GET  /health             - health check\n`);
+  console.log(`  POST /api/create-google-meet  - create Google Meet space`);
+  console.log(`  POST /api/create-teams-meeting- create Teams online meeting`);
+  console.log(`  POST /api/schedule-bot        - schedule bot for existing meeting`);
+  console.log(`  POST /api/batch-schedule      - schedule multiple interviews`);
+  console.log(`  GET  /api/report/:id          - get interview report`);
+  console.log(`  GET  /meeting-page            - interview UI`);
+  console.log(`  GET  /health                  - health check\n`);
 });
 
 server.on("error", (err) => {

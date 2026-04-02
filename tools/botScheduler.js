@@ -10,7 +10,7 @@
  * @param {string} config.resume           - Resume text (plain text)
  * @param {string} config.meeting_url      - Zoom / Teams / Google Meet URL
  * @param {string|Date} config.meeting_time - ISO 8601 datetime (>10 min future for guaranteed join)
- * @param {string} config.interview_type   - "technical" | "hr" | "mixed"
+ * @param {string} config.interview_type   - "technical" | "behavioral" | "mixed"
  * @param {string} config.difficulty       - "easy" | "medium" | "hard"
  * @param {string} config.ngrok_url        - Public HTTPS URL of this server
  *
@@ -36,6 +36,7 @@ export async function scheduleInterviewBot(config) {
     meeting_time,
     interview_type  = "mixed",
     difficulty      = "medium",
+    language        = "en-US",
     ngrok_url,
   } = config;
 
@@ -56,10 +57,10 @@ export async function scheduleInterviewBot(config) {
   }
 
   const minutesUntilJoin = (joinTime.getTime() - Date.now()) / 60000;
-  if (minutesUntilJoin < 2) {
+  if (minutesUntilJoin < 10) {
     return {
       success: false,
-      error: `meeting_time must be at least 2 minutes in the future (${minutesUntilJoin.toFixed(1)} min given)`,
+      error: `meeting_time must be at least 10 minutes in the future for guaranteed bot join (${minutesUntilJoin.toFixed(1)} min given)`,
     };
   }
 
@@ -87,12 +88,20 @@ export async function scheduleInterviewBot(config) {
   });
   const meetingPageUrl = `${ngrok_url}/meeting-page?${params}`;
 
+  // Map BCP-47 language tag (e.g. "hi-IN", "ja-JP") to Recall.ai language code (e.g. "hi", "ja")
+  const recallLangCode = language.split("-")[0];
+
+  // Truncate bot_name to Recall.ai's 100-character limit
+  const rawBotName = `AI Interview: ${candidate_name}`;
+  const botName    = rawBotName.length > 100 ? rawBotName.substring(0, 97) + "..." : rawBotName;
+
   // --- Build Recall.ai bot payload ---
   const payload = {
-    bot_name:   `AI Interview: ${candidate_name}`,
+    bot_name:   botName,
     meeting_url,
     join_at:    joinTime.toISOString(),
-    dedup_key:  dedupKey,
+    // NOTE: dedup_key is intentionally omitted — not a documented Recall.ai field.
+    // dedupKey is used only for generating a stable preSessionId above.
 
     // Bot camera shows the interview UI page
     output_media: {
@@ -115,7 +124,7 @@ export async function scheduleInterviewBot(config) {
         provider: {
           recallai_streaming: {
             mode:          "prioritize_low_latency",
-            language_code: "en",
+            language_code: recallLangCode,
           },
         },
       },
@@ -129,12 +138,16 @@ export async function scheduleInterviewBot(config) {
       ],
     },
 
-    // Store interview metadata on the bot for lookup later
+    // Store interview metadata on the bot for lookup later.
+    // IMPORTANT: session_id and language are included so webhooks can recover
+    // the correct session even after a server restart (botSessionMap is in-memory).
     metadata: {
       candidate_name,
       role,
       interview_type,
       difficulty,
+      language,
+      session_id: preSessionId,
       server_url: ngrok_url,
     },
   };

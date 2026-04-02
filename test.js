@@ -44,10 +44,10 @@ const clean = (...ids) => ids.forEach(deleteSession);
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\n── Conversation Quality (Human vs Robot) ──────────────────────\n");
 
-test("prompt instructs Alex to sound like a real human, not AI", () => {
+test("prompt instructs bot to sound warm and professional", () => {
   const s = makeSession("q-1");
   const p = buildRealtimeInstructions(s);
-  assert(p.includes("You are NOT an AI") || p.includes("real human"));
+  assert(p.includes("warm") || p.includes("professional AI interviewer") || p.includes("DataAlchemist"));
   clean("q-1");
 });
 
@@ -79,11 +79,12 @@ test("prompt bans 'As an AI'", () => {
   clean("q-4");
 });
 
-test("prompt instructs Alex to acknowledge previous answer", () => {
+test("prompt instructs bot to acknowledge previous answer naturally", () => {
   const s = makeSession("q-5");
   const p = buildRealtimeInstructions(s);
   assert(
-    p.includes("Acknowledge what the candidate just said") ||
+    p.includes("Mirror a specific") ||
+    p.includes("Acknowledge") ||
     p.includes("Reference something specific"),
   );
   clean("q-5");
@@ -129,14 +130,21 @@ test("evaluate_response tool has all score parameters", () => {
   assert(props.practical_experience, "Must have practical_experience");
 });
 
-test("transition_phase tool has next_phase enum", () => {
-  const tool = INTERVIEW_TOOLS.find(t => t.name === "transition_phase");
-  assert(tool, "transition_phase tool must exist");
-  const nextPhase = tool.parameters.properties.next_phase;
-  assert(nextPhase.enum.includes("resume"));
-  assert(nextPhase.enum.includes("technical"));
-  assert(nextPhase.enum.includes("behavioral"));
-  assert(nextPhase.enum.includes("closing"));
+test("INTERVIEW_TOOLS has correct tools for 3-question flow", () => {
+  const names = INTERVIEW_TOOLS.map(t => t.name);
+  assert(names.includes("evaluate_response"), "Must have evaluate_response");
+  assert(names.includes("end_interview"),      "Must have end_interview");
+  assert(names.includes("change_language"),    "Must have change_language");
+  assert(!names.includes("transition_phase"),  "transition_phase must be removed in 3-question flow");
+});
+
+test("end_interview tool has correct reason enum", () => {
+  const tool = INTERVIEW_TOOLS.find(t => t.name === "end_interview");
+  assert(tool, "end_interview tool must exist");
+  const reasons = tool.parameters.properties.reason.enum;
+  assert(reasons.includes("all_questions_complete"), "Must include all_questions_complete");
+  assert(reasons.includes("time_expired"),           "Must include time_expired");
+  assert(reasons.includes("candidate_requested_end"),"Must include candidate_requested_end");
 });
 
 test("end_interview tool exists with reason parameter", () => {
@@ -152,11 +160,11 @@ test("prompt includes tool usage instructions", () => {
   clean("t-1");
 });
 
-test("greeting prompt is concise and mentions candidate name", () => {
+test("greeting prompt is concise and mentions candidate name and bot name", () => {
   const s = makeSession("t-2", { candidateName: "Marcus" });
   const p = buildGreetingPrompt(s);
-  assert(p.includes("Marcus"));
-  assert(p.includes("Alex"));
+  assert(p.includes("Marcus"),       "Must include candidate name");
+  assert(p.includes("DataAlchemist"),"Must include bot brand name");
   clean("t-2");
 });
 
@@ -256,7 +264,11 @@ test("prompt instructs SPECIFIC resume-based questions", () => {
 test("prompt warns NOT to ask generic questions when resume provided", () => {
   const s = makeSession("r-3", { resume: "10 years Python, FastAPI, AWS" });
   const p = buildRealtimeInstructions(s);
-  assert(p.includes("Do NOT ask generic") || p.includes("NOT ask"));
+  assert(
+    p.includes("Do NOT ask generic") ||
+    p.includes("NOT ask") ||
+    p.includes("Never ask a generic"),
+  );
   clean("r-3");
 });
 
@@ -420,8 +432,8 @@ test("technical → closing for technical interview (skips behavioral)", () => {
   clean("sm-3");
 });
 
-test("resume → behavioral for hr interview (skips technical)", () => {
-  const s = makeSession("sm-4", { interviewType: "hr" });
+test("resume → behavioral for behavioral interview (skips technical)", () => {
+  const s = makeSession("sm-4", { interviewType: "behavioral" });
   s.phase = PHASE.RESUME;
   advancePhase(s, "transition");
   assert.equal(s.phase, PHASE.BEHAVIORAL);
@@ -437,11 +449,12 @@ test("closing → done on close, sets session.done", () => {
   clean("sm-5");
 });
 
-test("ask increments phaseStep", () => {
+test("ask increments phaseStep without triggering auto-transition", () => {
   const s = makeSession("sm-6");
-  s.phase = PHASE.TECHNICAL; s.phaseStep = 1;
+  // Use INTRODUCTION phase — no limit entry in PHASE_QUESTION_COUNTS, so no auto-transition
+  s.phase = PHASE.INTRODUCTION; s.phaseStep = 0;
   advancePhase(s, "ask");
-  assert.equal(s.phaseStep, 2);
+  assert.equal(s.phaseStep, 1);
   clean("sm-6");
 });
 
@@ -606,6 +619,173 @@ test("deduplicates technologies", () => {
 });
 test("returns empty object for null", () => {
   assert.deepEqual(parseResume(null), {});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. 3-QUESTION LIMIT ENFORCEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── 3-Question Limit Enforcement ───────────────────────────────\n");
+
+test("evaluate_response returns remaining count after Q1", () => {
+  const s = makeSession("lim-1");
+  const result = processToolCall(s, "evaluate_response", {
+    communication: 7, technical_knowledge: 7, problem_solving: 6, practical_experience: 7,
+    question_asked: "Walk me through your background.",
+  });
+  assert.equal(result.status, "recorded");
+  assert.equal(result.remaining, 2, "2 questions should remain after Q1");
+  assert(!result.limit_reached, "limit_reached must be falsy after Q1");
+  clean("lim-1");
+});
+
+test("evaluate_response returns remaining count after Q2", () => {
+  const s = makeSession("lim-2");
+  s.questionsAsked = ["Q1 already asked"];
+  const result = processToolCall(s, "evaluate_response", {
+    communication: 8, technical_knowledge: 8, problem_solving: 7, practical_experience: 8,
+    question_asked: "Tell me about your work at Stripe.",
+  });
+  assert.equal(result.remaining, 1, "1 question should remain after Q2");
+  assert(!result.limit_reached, "limit_reached must be falsy after Q2");
+  clean("lim-2");
+});
+
+test("evaluate_response returns limit_reached=true after Q3", () => {
+  const s = makeSession("lim-3");
+  s.questionsAsked = ["Q1", "Q2"]; // pre-load 2 questions
+  const result = processToolCall(s, "evaluate_response", {
+    communication: 9, technical_knowledge: 9, problem_solving: 8, practical_experience: 9,
+    question_asked: "How did you design the rate limiter?",
+  });
+  assert.equal(result.status,        "recorded",          "status must be recorded");
+  assert.equal(result.limit_reached, true,                "limit_reached must be true after Q3");
+  assert(result.instruction,                              "instruction must be present");
+  assert(result.instruction.includes("end_interview"),    "instruction must mention end_interview");
+  assert.equal(s.questionsAsked.length, 3,               "session must have 3 questions recorded");
+  clean("lim-3");
+});
+
+test("prompt shows live question counter", () => {
+  const s = makeSession("lim-4");
+  s.questionsAsked = ["Q1"];
+  const p = buildRealtimeInstructions(s);
+  assert(p.includes("1 asked") || p.includes("1 asked /"), "Counter must show 1 asked");
+  clean("lim-4");
+});
+
+test("prompt shows LIMIT REACHED state when all 3 asked", () => {
+  const s = makeSession("lim-5");
+  s.questionsAsked = ["Q1", "Q2", "Q3"];
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("LIMIT REACHED") ||
+    p.includes("Do NOT ask another"),
+    "Prompt must signal limit reached to the model",
+  );
+  clean("lim-5");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. NOISE AND UNCLEAR AUDIO HANDLING
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── Noise & Unclear Audio Handling ─────────────────────────────\n");
+
+test("prompt contains unclear audio recovery instruction", () => {
+  const s = makeSession("noise-1");
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("audio dropped") ||
+    p.includes("garbled") ||
+    p.includes("unclear"),
+    "Prompt must instruct how to handle garbled/unclear audio",
+  );
+  clean("noise-1");
+});
+
+test("prompt bans 'I didn't understand you' response", () => {
+  const s = makeSession("noise-2");
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("I didn't understand") || p.includes("I didn't understand you"),
+    "Banned phrase must appear in the prompt (to forbid it)",
+  );
+  clean("noise-2");
+});
+
+test("prompt forbids penalising candidate for connection issues", () => {
+  const s = makeSession("noise-3");
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("connection issue") ||
+    p.includes("penalize") ||
+    p.includes("penalise"),
+    "Prompt must mention not penalizing for audio issues",
+  );
+  clean("noise-3");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. RESUME-ANCHORED QUESTION STRATEGY
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── Resume-Anchored Question Strategy ──────────────────────────\n");
+
+test("prompt mandates all questions come from the resume", () => {
+  const s = makeSession("anc-1", { resume: "Led backend team at Stripe using Go and Kafka" });
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("MUST COME FROM THIS RESUME") ||
+    p.includes("ALL 3 QUESTIONS") ||
+    p.includes("ALL 3"),
+    "Prompt must make resume-anchoring mandatory",
+  );
+  clean("anc-1");
+});
+
+test("prompt instructs asking about personal contributions not team", () => {
+  const s = makeSession("anc-2", { resume: "Built payment APIs" });
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("personally") ||
+    p.includes("personal") ||
+    p.includes("what they personally"),
+    "Prompt must focus on personal contributions",
+  );
+  clean("anc-2");
+});
+
+test("prompt instructs probing for measurable outcomes", () => {
+  const s = makeSession("anc-3", { resume: "Reduced latency by 40%" });
+  const p = buildRealtimeInstructions(s);
+  assert(
+    p.includes("how many") ||
+    p.includes("measurable") ||
+    p.includes("numbers"),
+    "Prompt must ask for measurable outcomes",
+  );
+  clean("anc-3");
+});
+
+test("greeting prompt references resume when available", () => {
+  const s = makeSession("anc-4", { resume: "Senior Eng at Google, 8 years" });
+  const p = buildGreetingPrompt(s);
+  assert(
+    p.includes("resume") ||
+    p.includes("MUST be anchored") ||
+    p.includes("first substantive question"),
+    "Greeting must prime the model to use resume for Q1",
+  );
+  clean("anc-4");
+});
+
+test("greeting prompt notes when no resume available", () => {
+  const s = makeSession("anc-5", { resume: null });
+  const p = buildGreetingPrompt(s);
+  assert(
+    p.includes("No resume") ||
+    p.includes("no resume"),
+    "Greeting must acknowledge absence of resume",
+  );
+  clean("anc-5");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@
 11. [Error Responses](#11-error-responses)
 12. [Language Support](#12-language-support)
 13. [Changelog](#13-changelog)
+14. [Recall.ai Bot Create API Reference](#14-recallai-bot-create-api-reference)
 
 ---
 
@@ -970,3 +971,401 @@ The AI will conduct the full interview — greetings, questions, follow-ups — 
 | 9 | `voice/tts.js` | Threw on ElevenLabs API errors instead of returning `null` — caused unhandled rejection that crashed the WebSocket audio flow | Changed `throw err` to `return null` for graceful degradation |
 | 10 | `tools/webhookSender.js` | `fetch()` to n8n not checked for `response.ok` — silent failures on HTTP 4xx/5xx | Added `response.ok` check, throws on failure; added 3× retry with exponential back-off |
 | 11 | `realtime/openaiRealtime.js` | Hardcoded model `gpt-4o-realtime-preview-2024-12-17` — breaks when OpenAI retires the preview version | Model now reads from `OPENAI_REALTIME_MODEL` env var, defaults to `gpt-4o-realtime-preview` |
+
+---
+
+## 14. Recall.ai Bot Create API Reference
+
+This section documents the official Recall.ai **Create Bot** endpoint that `server/tools/botScheduler.js` calls internally when you hit `/api/schedule-bot`.
+
+**Endpoint:** `POST https://{RECALL_REGION}.recall.ai/api/v1/bot/`
+**Auth:** `Token {RECALL_API_KEY}` header
+**Content-Type:** `application/json`
+
+> `RECALL_REGION` maps to your configured env var (e.g. `us-east-1`, `eu-central-1`, `ap-northeast-1`).
+
+---
+
+### Request Body
+
+#### Top-level Fields
+
+| Field                   | Type            | Required | Default              | Description                                                                                 |
+| :---------------------- | :-------------- | :------- | :------------------- | :------------------------------------------------------------------------------------------ |
+| `meeting_url`           | String          | ✅ Yes   | —                    | Full meeting URL (Google Meet, Zoom, Teams, Webex, etc.)                                    |
+| `bot_name`              | String          | No       | `"Meeting Notetaker"`| Display name shown to meeting participants. Length: 1–100 characters                        |
+| `join_at`               | String \| null  | No       | immediate join       | ISO 8601 UTC datetime. Set ≥10 minutes in the future for guaranteed scheduled join. Omit or set <10 min for ad-hoc immediate join |
+| `recording_config`      | Object          | No       | —                    | Controls what is recorded and how. See [recording_config](#recording_config)                |
+| `output_media`          | Object          | No       | —                    | Webpage to display via bot's virtual camera/screenshare. See [output_media](#output_media)  |
+| `automatic_video_output`| Object          | No       | —                    | Automatically inject a JPEG frame during recording states. See [automatic_video_output](#automatic_video_output) |
+| `automatic_audio_output`| Object          | No       | —                    | Automatically play MP3 audio during recording. See [automatic_audio_output](#automatic_audio_output) |
+| `chat`                  | Object          | No       | —                    | Auto-send chat messages on bot join or participant join. See [chat](#chat)                  |
+| `automatic_leave`       | Object          | No       | —                    | Timeout rules for automatic bot departure. See [automatic_leave](#automatic_leave)          |
+| `variant`               | Object          | No       | —                    | Platform-specific bot variant (compute tier). See [variant](#variant)                      |
+| `zoom`                  | Object          | No       | —                    | Zoom-specific authentication params. See [zoom](#zoom)                                      |
+| `google_meet`           | Object          | No       | —                    | Google Meet login group configuration                                                       |
+| `webex`                 | Object          | No       | —                    | Webex login group name                                                                      |
+| `breakout_room`         | Object          | No       | —                    | Breakout room joining behaviour                                                             |
+| `metadata`              | Object          | No       | `{}`                 | Free-form key-value pairs. Passed back in every webhook payload under `bot.metadata`        |
+
+---
+
+#### `recording_config`
+
+| Field                      | Type    | Default               | Description                                                                                     |
+| :------------------------- | :------ | :-------------------- | :---------------------------------------------------------------------------------------------- |
+| `transcript`               | Object  | —                     | Transcription settings (`provider`, `language`, etc.)                                           |
+| `realtime_endpoints`       | Array   | `[]`                  | Streaming destinations. Each item has `type` (`rtmp` · `websocket` · `webhook` · `desktop_sdk_callback`), `url`, and optional `events` filter |
+| `retention`                | Object  | —                     | `{ "type": "timed" }` or `{ "type": "forever" }` — how long artifacts are kept               |
+| `video_mixed_layout`       | String  | `"speaker_view"`      | `speaker_view` · `gallery_view` · `gallery_view_v2` · `audio_only`                            |
+| `video_mixed_mp4`          | Boolean | —                     | Enable mixed-layout MP4 recording                                                               |
+| `participant_events`       | Boolean | —                     | Record join/leave/mute participant events                                                        |
+| `meeting_metadata`         | Boolean | —                     | Capture meeting title, scheduled times, and other metadata                                      |
+| `start_recording_on`       | String  | `"call_join"`         | `call_join` · `participant_join` · `participant_speak` — when recording begins                 |
+| `include_bot_in_recording` | Boolean | `false`               | Whether the bot itself appears in the recorded video                                            |
+| `audio_mixed_raw`          | Boolean | —                     | Raw mixed audio (PCM)                                                                           |
+| `audio_mixed_mp3`          | Boolean | —                     | Mixed audio as MP3                                                                              |
+| `video_separate_mp4`       | Boolean | —                     | Per-participant video MP4 files                                                                 |
+| `audio_separate_raw`       | Boolean | —                     | Per-participant raw audio (PCM)                                                                 |
+| `audio_separate_mp3`       | Boolean | —                     | Per-participant audio as MP3                                                                    |
+| `video_mixed_flv`          | Boolean | —                     | Mixed video as FLV (legacy)                                                                     |
+| `video_separate_png`       | Boolean | —                     | Per-participant video as PNG frames                                                             |
+| `video_separate_h264`      | Boolean | —                     | Per-participant video as raw H.264                                                              |
+
+---
+
+#### `output_media`
+
+Controls what the bot displays via its virtual camera and screenshare.
+
+```json
+{
+  "output_media": {
+    "camera": {
+      "kind": "webpage",
+      "config": {
+        "url": "https://your-server/meeting-page?sessionId=bot_123&candidate=Priya+Sharma"
+      }
+    },
+    "screenshare": {
+      "kind": "webpage",
+      "config": {
+        "url": "https://your-server/meeting-page?sessionId=bot_123"
+      }
+    }
+  }
+}
+```
+
+Both `camera` and `screenshare` accept an `OutputMediaWebpageRequest`:
+
+| Field        | Type   | Description                                           |
+| :----------- | :----- | :---------------------------------------------------- |
+| `kind`       | String | Always `"webpage"`                                    |
+| `config.url` | String | Full HTTPS URL of the page to render in the bot frame |
+
+---
+
+#### `automatic_video_output`
+
+Inject a static JPEG image into the bot's video output during specific recording states.
+
+```json
+{
+  "automatic_video_output": {
+    "in_call_recording": {
+      "kind": "jpeg",
+      "b64_data": "<base64-encoded-jpeg>"
+    },
+    "in_call_not_recording": {
+      "kind": "jpeg",
+      "b64_data": "<base64-encoded-jpeg>"
+    }
+  }
+}
+```
+
+---
+
+#### `automatic_audio_output`
+
+Play an MP3 file automatically when the bot enters the recording state.
+
+```json
+{
+  "automatic_audio_output": {
+    "in_call_recording": {
+      "kind": "mp3",
+      "b64_data": "<base64-encoded-mp3>",
+      "replay_on_participant_join": true
+    }
+  }
+}
+```
+
+| Field                      | Type    | Description                                               |
+| :------------------------- | :------ | :-------------------------------------------------------- |
+| `kind`                     | String  | Always `"mp3"`                                            |
+| `b64_data`                 | String  | Base64-encoded MP3 audio content                          |
+| `replay_on_participant_join`| Boolean| Replay audio whenever a new participant joins the call    |
+
+---
+
+#### `chat`
+
+Auto-send chat messages inside the meeting.
+
+```json
+{
+  "chat": {
+    "on_bot_join": {
+      "send_to": "everyone",
+      "message": "Hi! I'm the DataAlchemist Interview AI. The interview will begin shortly.",
+      "pin": false
+    },
+    "on_participant_join": {
+      "send_to": "everyone",
+      "message": "Welcome! Please make sure your microphone is on."
+    }
+  }
+}
+```
+
+| Field            | Type    | Description                                                              |
+| :--------------- | :------ | :----------------------------------------------------------------------- |
+| `send_to`        | String  | `"host"` · `"everyone"` · `"everyone_except_host"`                      |
+| `message`        | String  | Chat message text to send                                                |
+| `pin`            | Boolean | Pin the message in the chat panel (if platform supports it)              |
+
+---
+
+#### `automatic_leave`
+
+Configure when the bot should automatically leave the meeting.
+
+| Field                             | Type    | Default  | Min | Description                                                        |
+| :-------------------------------- | :------ | :------- | :-- | :----------------------------------------------------------------- |
+| `waiting_room_timeout`            | Integer | `1200`   | 30  | Seconds to wait in waiting room before leaving (≥30)              |
+| `noone_joined_timeout`            | Integer | —        | —   | Seconds to wait for anyone to join before leaving                  |
+| `everyone_left_timeout`           | Integer | —        | —   | Seconds after everyone leaves before bot departs                   |
+| `in_call_not_recording_timeout`   | Integer | `3600`   | 1   | Seconds to stay in call when not recording before auto-leaving (≥1)|
+| `in_call_recording_timeout`       | Integer | —        | —   | Max seconds in call while recording                                |
+| `recording_permission_denied_timeout` | Integer | —    | —   | Seconds to wait after recording permission denied before leaving   |
+| `silence_detection`               | Object  | —        | —   | Leave after N seconds of silence (`{ "timeout": 300 }`)           |
+| `bot_detection`                   | Object  | —        | —   | Leave if another recording bot is detected in the call             |
+
+**Example — interview bot leave policy:**
+
+```json
+{
+  "automatic_leave": {
+    "waiting_room_timeout": 300,
+    "noone_joined_timeout": 120,
+    "everyone_left_timeout": 30,
+    "in_call_not_recording_timeout": 60,
+    "silence_detection": { "timeout": 600 }
+  }
+}
+```
+
+---
+
+#### `variant`
+
+Select the compute tier for each meeting platform. Higher tiers provide better performance for GPU-intensive rendering.
+
+| Platform           | Values                               |
+| :----------------- | :----------------------------------- |
+| `zoom`             | `web` · `web_4_core` · `web_gpu`     |
+| `google_meet`      | `web` · `web_4_core` · `web_gpu`     |
+| `microsoft_teams`  | `web` · `web_4_core` · `web_gpu`     |
+| `webex`            | `web` · `web_4_core` · `web_gpu`     |
+
+```json
+{
+  "variant": {
+    "google_meet": "web_4_core"
+  }
+}
+```
+
+> Use `web_gpu` if the meeting page renders complex WebGL / canvas animations. Use `web_4_core` for standard HTML pages with audio playback (recommended for this project). Use `web` for lightweight pages.
+
+---
+
+#### `zoom`
+
+Zoom-specific authentication (for private/authenticated Zoom meetings).
+
+| Field            | Type   | Description                                             |
+| :--------------- | :----- | :------------------------------------------------------ |
+| `join_token_url` | String | URL to fetch a Zoom SDK join token                      |
+| `zak_url`        | String | URL to fetch a Zoom Access Key (ZAK) token              |
+| `obf_token_url`  | String | URL to fetch an obfuscation token                       |
+| `user_email`     | String | Email for joining authenticated Zoom meetings           |
+
+---
+
+#### `google_meet`
+
+| Field                  | Type   | Description                                        |
+| :--------------------- | :----- | :------------------------------------------------- |
+| `google_login_group_id`| String | Recall.ai Google login group ID for authenticated joins |
+
+---
+
+#### `webex`
+
+| Field              | Type   | Description                         |
+| :----------------- | :----- | :---------------------------------- |
+| `login_group_name` | String | Webex login group name              |
+
+---
+
+#### `breakout_room`
+
+| Field    | Type   | Description                                                                                  |
+| :------- | :----- | :------------------------------------------------------------------------------------------- |
+| `mode`   | String | `join_main_room` · `join_specific_room` · `auto_accept_all_invites`                         |
+| `room_id`| String | Required when `mode` is `join_specific_room` — the target breakout room identifier          |
+
+---
+
+### Full Example Request
+
+This is how `botScheduler.js` constructs the Recall.ai bot create request:
+
+```bash
+curl -X POST https://us-east-1.recall.ai/api/v1/bot/ \
+  -H "Authorization: Token YOUR_RECALL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "meeting_url": "https://meet.google.com/abc-defg-hij",
+    "bot_name": "DataAlchemist Interview AI",
+    "join_at": "2025-06-20T10:00:00Z",
+    "output_media": {
+      "camera": {
+        "kind": "webpage",
+        "config": {
+          "url": "https://a1b2c3d4.ngrok-free.app/meeting-page?sessionId=bot_1750420800000&candidate=Priya+Sharma&role=Senior+Backend+Engineer&difficulty=hard&type=technical"
+        }
+      }
+    },
+    "recording_config": {
+      "transcript": { "provider": "default" },
+      "start_recording_on": "call_join",
+      "video_mixed_layout": "speaker_view"
+    },
+    "automatic_leave": {
+      "waiting_room_timeout": 300,
+      "noone_joined_timeout": 120,
+      "everyone_left_timeout": 30,
+      "in_call_not_recording_timeout": 60
+    },
+    "chat": {
+      "on_bot_join": {
+        "send_to": "everyone",
+        "message": "Hi! I am the DataAlchemist Interview AI Agent. The interview will begin momentarily — please ensure your microphone is unmuted.",
+        "pin": false
+      }
+    },
+    "metadata": {
+      "candidate_name": "Priya Sharma",
+      "role": "Senior Backend Engineer",
+      "interview_type": "technical",
+      "difficulty": "hard",
+      "session_id": "bot_1750420800000"
+    }
+  }'
+```
+
+> **Important:** `metadata` is echoed back in every Recall.ai webhook payload under `data.bot.metadata`. This server uses it to correlate webhooks (`bot.in_call_recording`, `bot.call_ended`, `bot.done`) back to the correct interview session via `session_id`.
+
+---
+
+### Response — 201 Created
+
+```json
+{
+  "id": "7f3a1c2d-89ab-4ef0-b123-456789abcdef",
+  "meeting_url": "https://meet.google.com/abc-defg-hij",
+  "bot_name": "DataAlchemist Interview AI",
+  "join_at": "2025-06-20T10:00:00Z",
+  "recording_config": {
+    "transcript": { "provider": "default" },
+    "start_recording_on": "call_join",
+    "video_mixed_layout": "speaker_view",
+    "realtime_endpoints": [],
+    "retention": { "type": "timed" }
+  },
+  "status_changes": [
+    {
+      "code": "ready",
+      "message": "Bot is ready and will join at the scheduled time",
+      "created_at": "2025-06-20T08:45:00.000Z",
+      "sub_code": null
+    }
+  ],
+  "recordings": [],
+  "output_media": {
+    "camera": {
+      "kind": "webpage",
+      "config": {
+        "url": "https://a1b2c3d4.ngrok-free.app/meeting-page?sessionId=bot_1750420800000&..."
+      }
+    }
+  },
+  "automatic_leave": {
+    "waiting_room_timeout": 300,
+    "noone_joined_timeout": 120,
+    "everyone_left_timeout": 30,
+    "in_call_not_recording_timeout": 60
+  },
+  "chat": {
+    "on_bot_join": {
+      "send_to": "everyone",
+      "message": "Hi! I am the DataAlchemist Interview AI Agent...",
+      "pin": false
+    }
+  },
+  "metadata": {
+    "candidate_name": "Priya Sharma",
+    "role": "Senior Backend Engineer",
+    "interview_type": "technical",
+    "difficulty": "hard",
+    "session_id": "bot_1750420800000"
+  },
+  "variant": null,
+  "zoom": null,
+  "google_meet": null,
+  "webex": null,
+  "breakout_room": null,
+  "calendar_meetings": []
+}
+```
+
+#### Key Response Fields
+
+| Field            | Type   | Description                                                               |
+| :--------------- | :----- | :------------------------------------------------------------------------ |
+| `id`             | UUID   | Recall.ai bot ID — returned as `bot_id` by `/api/schedule-bot`           |
+| `status_changes` | Array  | Bot lifecycle status history (`ready` → `joining_call` → `in_call_recording` → `call_ended` → `done`) |
+| `recordings`     | Array  | List of recording artifacts once the call ends (each has `id`, `status`, `media_shortcuts`) |
+| `metadata`       | Object | The `metadata` object you passed at create time — echoed in all webhooks |
+
+---
+
+### Bot Status Flow
+
+```
+ready
+  └─► joining_call
+        ├─► in_waiting_room  (if host hasn't admitted the bot)
+        │     └─► in_call_not_recording
+        └─► in_call_not_recording
+              └─► in_call_recording   ← server creates session here
+                    └─► call_ended    ← server generates report here
+                          └─► done    ← all artifacts processed
+```
+
+> `bot.in_call_recording` and `bot.call_ended` are the two critical webhook events this server uses. Both fire `sendResultsToN8n()` — guarded by the `resultsSent` flag so only the first to fire wins.

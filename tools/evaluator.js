@@ -3,7 +3,7 @@
 
 import { advancePhase } from "../agent/stateMachine.js";
 import { PHASE } from "../sessions/sessionManager.js";
-import { LANGUAGES } from "./questionGenerator.js";
+import { LANGUAGES, MAX_INTERVIEW_QUESTIONS } from "./questionGenerator.js";
 
 // Legacy regex for backward compatibility with non-Realtime API paths
 const META_REGEX = /\[META\]\s*phase:(\w+)\s+action:(\w+)\s+comm:(\d+)\s+tech:(\d+)\s+solve:(\d+)\s+exp:(\d+)\s+question:(.*?)(?:\n|$)/i;
@@ -33,9 +33,9 @@ export function processToolCall(session, toolName, args) {
   switch (toolName) {
     case "evaluate_response": {
       const scores = {
-        communication:      Math.min(10, Math.max(0, args.communication || 0)),
-        technicalKnowledge: Math.min(10, Math.max(0, args.technical_knowledge || 0)),
-        problemSolving:     Math.min(10, Math.max(0, args.problem_solving || 0)),
+        communication:       Math.min(10, Math.max(0, args.communication        || 0)),
+        technicalKnowledge:  Math.min(10, Math.max(0, args.technical_knowledge  || 0)),
+        problemSolving:      Math.min(10, Math.max(0, args.problem_solving      || 0)),
         practicalExperience: Math.min(10, Math.max(0, args.practical_experience || 0)),
       };
 
@@ -45,16 +45,35 @@ export function processToolCall(session, toolName, args) {
         recordScores(session, scores);
       }
 
-      // Track question for dedup
+      // Track question for deduplication and limit enforcement
       if (args.question_asked) {
         session.questionsAsked.push(args.question_asked);
       }
 
-      // Advance state machine (new question asked)
+      // Advance state machine
       advancePhase(session, "ask");
 
-      console.log(`[Eval] Scores recorded — comm:${scores.communication} tech:${scores.technicalKnowledge} solve:${scores.problemSolving} exp:${scores.practicalExperience}`);
-      return { status: "recorded", phase: session.phase };
+      const totalAsked = session.questionsAsked.length;
+      console.log(`[Eval] Q${totalAsked}/${MAX_INTERVIEW_QUESTIONS} scored — comm:${scores.communication} tech:${scores.technicalKnowledge} solve:${scores.problemSolving} exp:${scores.practicalExperience}`);
+
+      // Hard limit enforcement — signal AI to close and end when all questions are done
+      if (totalAsked >= MAX_INTERVIEW_QUESTIONS) {
+        console.log(`[Eval] Question limit reached (${totalAsked}/${MAX_INTERVIEW_QUESTIONS}) — signalling end`);
+        return {
+          status: "recorded",
+          phase:  session.phase,
+          limit_reached: true,
+          instruction: `All ${MAX_INTERVIEW_QUESTIONS} questions have been asked and scored. Speak ONE warm closing sentence now, then IMMEDIATELY call end_interview with reason "all_questions_complete". Do NOT ask another question.`,
+        };
+      }
+
+      const remaining = MAX_INTERVIEW_QUESTIONS - totalAsked;
+      return {
+        status:    "recorded",
+        phase:     session.phase,
+        remaining: remaining,
+        instruction: `${remaining} question${remaining > 1 ? "s" : ""} remaining. Ask the next resume-anchored question.`,
+      };
     }
 
     case "transition_phase": {
