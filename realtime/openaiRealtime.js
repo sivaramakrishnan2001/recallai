@@ -4,10 +4,10 @@
 
 import WebSocket from "ws";
 
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
-const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
-const RECONNECT_MAX = 3;
-const RECONNECT_DELAY = 2000;
+const REALTIME_MODEL  = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+const REALTIME_URL    = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
+const RECONNECT_MAX   = 3;
+const RECONNECT_DELAY = 2000;   // ms base — doubled on each retry (exponential back-off)
 
 export class RealtimeSession {
   /**
@@ -25,6 +25,12 @@ export class RealtimeSession {
     this.ws = null;
     this.connected = false;
     this.reconnectAttempts = 0;
+    this._reconnectTimer = null;
+    this._intentionallyClosed = false;
+
+    // Store connect args so we can replay them on automatic reconnect
+    this._connectInstructions = null;
+    this._connectTools = [];
 
     // Callbacks
     this.onResponseText  = options.onResponseText  || (() => {});
@@ -52,6 +58,11 @@ export class RealtimeSession {
   async connect(instructions, tools = []) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY not set");
+
+    // Persist so reconnect can replay with the same config
+    this._connectInstructions = instructions;
+    this._connectTools = tools;
+    this._intentionallyClosed = false;
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(REALTIME_URL, {
@@ -91,10 +102,10 @@ export class RealtimeSession {
               type: "server_vad",
               threshold: 0.5,
               prefix_padding_ms: 300,
-              silence_duration_ms: 800,
+              silence_duration_ms: 1500,  // was 800 — 1500 ms reduces false turn-endings
             },
-            temperature: 0.7,
-            max_response_output_tokens: 300,
+            temperature: 0.45,            // was 0.7 — lower = more consistent interviewer tone
+            max_response_output_tokens: 500, // was 300 — allows complete multi-sentence responses
           },
         });
 
@@ -120,9 +131,49 @@ export class RealtimeSession {
       this.ws.on("close", (code, reason) => {
         this.connected = false;
         console.log(`[Realtime] Disconnected (${code})`);
-        this.onClose();
+
+        // Intentional close — do not reconnect
+        if (this._intentionallyClosed) {
+          this.onClose();
+          return;
+        }
+
+        // Unexpected drop — attempt exponential back-off reconnect
+        if (this.reconnectAttempts < RECONNECT_MAX) {
+          const delay = RECONNECT_DELAY * Math.pow(2, this.reconnectAttempts);
+          this.reconnectAttempts++;
+          console.log(`[Realtime] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${RECONNECT_MAX})...`);
+          this._reconnectTimer = setTimeout(() => {
+            this._reconnect();
+          }, delay);
+        } else {
+          console.error(`[Realtime] Max reconnect attempts (${RECONNECT_MAX}) reached — giving up`);
+          this.onError(new Error("OpenAI Realtime connection lost — max reconnect attempts exceeded"));
+          this.onClose();
+        }
       });
     });
+  }
+
+  /**
+   * Internal reconnect — re-opens the WebSocket and re-applies session config.
+   * Resets state accumulators so partial responses don't bleed through.
+   */
+  async _reconnect() {
+    console.log("[Realtime] Attempting reconnect...");
+    // Clear stale state
+    this._responseText = "";
+    this._toolCallArgs = {};
+    this._currentResponseId = null;
+    this._pendingToolResults = 0;
+
+    try {
+      await this.connect(this._connectInstructions, this._connectTools);
+      console.log("[Realtime] Reconnect successful");
+    } catch (err) {
+      console.error("[Realtime] Reconnect failed:", err.message);
+      // The close handler will fire again and either retry or give up
+    }
   }
 
   /**
@@ -265,14 +316,11 @@ export class RealtimeSession {
   }
 
   /**
-   * Submit tool call result back to OpenAI
-   * @param {string} callId - The call_id from the tool call event
-   * @param {Object} result - Result data to return to the model
-   */
-  /**
    * Submit tool call result back to OpenAI.
    * Does NOT auto-trigger response.create — that's handled by response.done
    * to batch multiple tool results before triggering one response.
+   * @param {string} callId - The call_id from the tool call event
+   * @param {Object} result - Result data to return to the model
    */
   submitToolResult(callId, result) {
     if (!this.connected) return;
@@ -286,39 +334,54 @@ export class RealtimeSession {
   }
 
   /**
-   * Update session configuration (e.g., change instructions mid-interview)
-   * @param {Object} config - Partial session config to merge
+   * Update session instructions (e.g., question counter changed mid-interview)
+   * @param {string} instructions - New system prompt
    */
   updateInstructions(instructions) {
     if (!this.connected) return;
+    // Keep local copy fresh so reconnect replays the latest instructions
+    this._connectInstructions = instructions;
     this._sendEvent("session.update", {
       session: { instructions },
     });
   }
 
   /**
-   * Trigger a response from the model (e.g., for greeting)
-   * @param {string} text - Optional instruction/prompt for this response
+   * Trigger a model response, optionally primed with a system-side instruction.
+   *
+   * Bug fix: the old implementation injected the prompt as role "user", which
+   * polluted conversation history making it look like the candidate said it.
+   * We now use session.update to temporarily set the instructions (if a text
+   * hint is given) and then fire response.create.  The instructions are already
+   * part of the session config so the model produces the greeting naturally
+   * without a fake user turn in the transcript.
+   *
+   * @param {string} [text] - Optional one-shot instruction hint (appended to
+   *   session instructions for this turn only via a transient session.update)
    */
   triggerResponse(text) {
     if (!this.connected) return;
     if (text) {
-      // Add a system-like instruction as user message, then trigger
-      this._sendEvent("conversation.item.create", {
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text }],
-        },
+      // Temporarily extend the system instructions with the one-shot hint so
+      // the model knows what to say, without fabricating a candidate message.
+      // The next updateInstructions() call from the interviewer will overwrite this.
+      const hintedInstructions = `${this._connectInstructions || ""}\n\n[CURRENT ACTION REQUIRED]: ${text}`;
+      this._sendEvent("session.update", {
+        session: { instructions: hintedInstructions },
       });
     }
     this._sendEvent("response.create", {});
   }
 
   /**
-   * Close the connection
+   * Gracefully close the connection (no reconnect will be attempted)
    */
   close() {
+    this._intentionallyClosed = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this.ws) {
       try {
         this.ws.close();

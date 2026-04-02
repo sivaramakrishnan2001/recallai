@@ -21,7 +21,6 @@ dotenv.config();
 import express from "express";
 import cors from "cors";
 import { createServer } from "http";
-import { createHash } from "crypto";
 import { WebSocketServer } from "ws";
 
 import {
@@ -68,7 +67,22 @@ const app = express();
 const server = createServer(app);
 
 app.use(express.json({ limit: "10mb" }));
-app.use(cors());
+
+// CORS — restrict to configured origins in production; allow all in development
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+  : null;
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (server-to-server, curl, Recall.ai webhooks)
+    if (!origin) return cb(null, true);
+    // Allow all if ALLOWED_ORIGINS not configured (dev mode)
+    if (!ALLOWED_ORIGINS) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
 
 // =============================================================================
 // Active Realtime Sessions — Map<sessionId, { realtime, clientWs }>
@@ -128,7 +142,11 @@ wss.on("connection", (ws, req) => {
               // Record in session history
               session.history.push({ role: "assistant", content: text, phase: session.phase });
 
-              // Generate TTS audio
+              // Always push text + phase to client immediately (UI update must not
+              // wait on TTS — avoids Bug 3 where null audio swallows the phase update)
+              wsSend(ws, { type: "text", text, phase: session.phase });
+
+              // Generate TTS audio — null returned on failure, interview continues
               let audioBase64 = null;
               try {
                 audioBase64 = await textToSpeech(text);
@@ -136,21 +154,21 @@ wss.on("connection", (ws, req) => {
                 console.error("[TTS] Error:", err.message);
               }
 
-              // Send to client
-              wsSend(ws, {
-                type:  "audio",
-                data:  audioBase64,
-                text,
-                phase: session.phase,
-              });
+              // Send audio separately — only if TTS produced data
+              if (audioBase64) {
+                wsSend(ws, { type: "audio", data: audioBase64, phase: session.phase });
+              }
 
               // Check if interview is done — guard with resultsSent to prevent
-              // duplicate n8n deliveries (WS path + Recall.ai webhook both trigger this)
+              // duplicate n8n deliveries (WS path + Recall.ai webhook both trigger this).
+              // Bug 7 fix: delay the "done" signal until the audio queue drains on the
+              // client — we signal "done_pending" so the client shows it after playback.
               if (session.done && !session.resultsSent) {
                 session.resultsSent = true;
                 await sendResultsToN8n(session);
                 const report = generateReport(session);
-                wsSend(ws, { type: "done", report });
+                // done_pending: client shows overlay only after TTS queue finishes
+                wsSend(ws, { type: "done_pending", report });
                 console.log(`[Interview] Complete [${sessionId}] score=${report.overall_score}`);
               }
             },
@@ -165,14 +183,29 @@ wss.on("connection", (ws, req) => {
               console.log(`[Realtime] Tool call: ${name}`, JSON.stringify(args).substring(0, 100));
               const result = processToolCall(session, name, args);
 
+              // Bug 1 fix: realtimeSession may not yet be assigned if OpenAI fires a
+              // tool call synchronously during connect(). Guard before every use.
+              if (!realtimeSession) {
+                console.warn("[Realtime] Tool call arrived before session assigned — queuing result");
+                // Store for submittal after connect resolves
+                setImmediate(() => {
+                  if (realtimeSession?.isConnected) {
+                    realtimeSession.submitToolResult(callId, result);
+                  }
+                });
+                return;
+              }
+
               // Submit result back to OpenAI
               realtimeSession.submitToolResult(callId, result);
 
               // Notify client of phase changes
               wsSend(ws, { type: "phase", phase: session.phase });
 
-              // Update OpenAI instructions if phase or language changed
-              if (name === "transition_phase" || name === "change_language") {
+              // Rebuild instructions whenever anything that affects the prompt changes:
+              // language switch, phase transition, or question limit signal
+              if (name === "transition_phase" || name === "change_language" ||
+                  name === "evaluate_response") {
                 const updatedInstructions = buildRealtimeInstructions(session);
                 realtimeSession.updateInstructions(updatedInstructions);
               }
@@ -313,12 +346,14 @@ function createDedupKey(botId, event, text) {
 
 function isDuplicate(key) {
   if (processedEvents.has(key)) return true;
-  processedEvents.set(key, Date.now());
-  if (processedEvents.size > 1000) {
+  // Bug 4 fix: GC before inserting, not after — keeps map bounded at all times
+  if (processedEvents.size >= 1000) {
+    const now = Date.now();
     for (const [k, v] of processedEvents.entries()) {
-      if (Date.now() - v > EVENT_DEDUP_TTL) processedEvents.delete(k);
+      if (now - v > EVENT_DEDUP_TTL) processedEvents.delete(k);
     }
   }
+  processedEvents.set(key, Date.now());
   return false;
 }
 
@@ -409,10 +444,11 @@ app.post("/api/batch-schedule", async (req, res) => {
       const sid = r.session_id;
       createSession(sid, {
         candidateName: r.candidate_name,
-        role: r.role,
-        resume: r.resume,
+        role:          r.role,
+        resume:        r.resume,
         interviewType: r.interview_config?.interview_type || "mixed",
-        difficulty: r.interview_config?.difficulty || "medium",
+        difficulty:    r.interview_config?.difficulty     || "medium",
+        language:      r.interview_config?.language       || "en-US",
       });
       botSessionMap.set(r.bot_id, sid);
       successful.push(r);
@@ -717,9 +753,17 @@ app.post("/webhook/recall/transcript", (req, res) => {
   const conn = activeConnections.get(sessionId);
   if (!conn?.realtime?.isConnected) return;
 
-  // Filter bot's own speech
+  // Filter bot's own speech — use exact/prefix checks, NOT substring "ai"
+  // which incorrectly drops candidates named Abigail, Mikail, etc. (Bug 8)
   const nameStr = (participant.name || "").toLowerCase();
-  if (nameStr.includes("bot") || nameStr.includes("ai") || nameStr.includes("dataalchemist")) return;
+  const isBotSpeaker =
+    nameStr === "ai interview" ||
+    nameStr.startsWith("dataalchemist") ||
+    nameStr.startsWith("ai interview") ||
+    nameStr === "bot" ||
+    nameStr.includes("recall") ||
+    nameStr.includes("notetaker");
+  if (isBotSpeaker) return;
 
   if (isPartial) return; // Only process finalized transcript
 
@@ -910,6 +954,8 @@ body{
   var ws = null;
   var playing = false, interviewDone = false;
   var audioQueue = [], currentAudio = null;
+  var pendingDone = false;         // Bug 7: set true when done_pending arrives
+  var pendingDoneReport = null;    // holds report until audio queue drains
   var startTime = null;
   var currentPhase = 'introduction';
   var audioContext = null, micStream = null, timerInterval = null;
@@ -984,9 +1030,16 @@ body{
     if (audioQueue.length === 0) {
       playing = false;
       currentAudio = null;
-      setMode('listening', 'Listening...', CFG.candidate + ' - ' + CFG.role);
       // TTS finished naturally — flush any residual echo from OpenAI's audio buffer
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'clear_audio' }));
+      // Bug 7 fix: show done overlay only after the last TTS chunk finishes playing
+      if (pendingDone) {
+        pendingDone = false;
+        interviewDone = true;
+        setTimeout(function() { $overlay.classList.add('show'); }, 800);
+        return;
+      }
+      setMode('listening', 'Listening...', CFG.candidate + ' - ' + CFG.role);
       return;
     }
     playing = true;
@@ -1093,9 +1146,14 @@ body{
           startAudioCapture();
           break;
 
+        case 'text':
+          // Bug 3 fix: text + phase pushed separately from audio so UI always updates
+          if (msg.phase) updatePhase(msg.phase);
+          if (msg.text)  $sub.textContent = msg.text;
+          break;
+
         case 'audio':
           if (msg.phase) updatePhase(msg.phase);
-          if (msg.text) $sub.textContent = msg.text;
           enqueueAudio(msg.data);
           break;
 
@@ -1135,7 +1193,20 @@ body{
           setMode('processing', 'Thinking...', '');
           break;
 
+        case 'done_pending':
+          // Bug 7 fix: defer overlay until TTS audio queue is empty
+          pendingDone = true;
+          pendingDoneReport = msg.report || null;
+          // If nothing is playing right now, show immediately
+          if (!playing && audioQueue.length === 0) {
+            pendingDone = false;
+            interviewDone = true;
+            setTimeout(function() { $overlay.classList.add('show'); }, 800);
+          }
+          break;
+
         case 'done':
+          // Legacy / direct done (e.g. from Recall.ai webhook path)
           interviewDone = true;
           setTimeout(function() { $overlay.classList.add('show'); }, 2000);
           break;

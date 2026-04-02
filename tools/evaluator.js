@@ -199,22 +199,64 @@ export function generateReport(session) {
   const strengths  = [];
   const weaknesses = [];
 
+  // Communication
   if (stats.communication.count > 0) {
-    if (commScore >= 7) strengths.push("Strong communication skills");
-    if (commScore < 5)  weaknesses.push("Communication needs improvement");
+    if      (commScore >= 8.5) strengths.push("Exceptionally clear communicator — structured, confident, and easy to follow under pressure");
+    else if (commScore >= 7)   strengths.push("Communicates clearly and concisely with good structure");
+    else if (commScore >= 5.5) weaknesses.push("Communication is adequate but could benefit from more precision and structure");
+    else if (commScore >= 4)   weaknesses.push("Answers tended to be disorganised or hard to follow — communication needs development");
+    else                       weaknesses.push("Struggled to express ideas clearly — significant communication gap for this level");
   }
+
+  // Technical knowledge
   if (stats.technicalKnowledge.count > 0) {
-    if (techScore >= 7) strengths.push("Solid technical knowledge");
-    if (techScore < 5)  weaknesses.push("Technical knowledge gaps");
+    if      (techScore >= 8.5) strengths.push("Deep technical knowledge with real nuance — understands edge cases and underlying principles");
+    else if (techScore >= 7)   strengths.push("Solid technical foundation with evidence of hands-on depth");
+    else if (techScore >= 5.5) weaknesses.push("Technical knowledge is present but surface-level in places — may need support on complex problems");
+    else if (techScore >= 4)   weaknesses.push("Noticeable gaps in technical understanding for a role at this level");
+    else                       weaknesses.push("Technical knowledge did not meet the bar for this role — significant gaps identified");
   }
+
+  // Problem solving
   if (stats.problemSolving.count > 0) {
-    if (solveScore >= 7) strengths.push("Good problem-solving approach");
-    if (solveScore < 5)  weaknesses.push("Problem-solving could be stronger");
+    if      (solveScore >= 8.5) strengths.push("Exceptional problem-solving — systematic, creative, and explicitly considers tradeoffs");
+    else if (solveScore >= 7)   strengths.push("Approaches problems logically with clear reasoning");
+    else if (solveScore >= 5.5) weaknesses.push("Problem-solving is functional but lacks depth — tradeoffs and alternatives were rarely explored");
+    else if (solveScore >= 4)   weaknesses.push("Struggled to structure their thinking — analytical approach needs strengthening");
+    else                        weaknesses.push("Problem-solving approach was unclear or ineffective in the context of this role");
   }
+
+  // Practical experience
   if (stats.practicalExperience.count > 0) {
-    if (expScore >= 7) strengths.push("Relevant practical experience");
-    if (expScore < 5)  weaknesses.push("Limited practical experience demonstrated");
+    if      (expScore >= 8.5) strengths.push("Highly relevant hands-on experience — specific outcomes, scale, and personal ownership were evident");
+    else if (expScore >= 7)   strengths.push("Good practical background with concrete examples and real-world context");
+    else if (expScore >= 5.5) weaknesses.push("Experience was cited but lacked specifics — impact and personal contribution were hard to assess");
+    else if (expScore >= 4)   weaknesses.push("Answers relied heavily on theory or team-level work — limited evidence of direct ownership");
+    else                      weaknesses.push("Practical experience for this role and level was not adequately demonstrated");
   }
+
+  const hiringDecision = overall >= 8
+    ? "STRONG_YES"
+    : overall >= 6.5
+      ? "YES"
+      : overall >= 5
+        ? "MAYBE"
+        : "NO";
+
+  const hiringLabel = {
+    STRONG_YES: "Strong hire — recommend fast-tracking to next stage",
+    YES:        "Hire — meets the bar and worth pursuing",
+    MAYBE:      "On the fence — a second opinion or deeper technical screen is advised",
+    NO:         "Pass — did not meet the required standard for this role at this time",
+  };
+
+  const summary = overall >= 8
+    ? `${session.candidateName} had an excellent interview for the ${session.role} role. Answers were specific, well-reasoned, and showed real depth. Strong recommend for the next stage.`
+    : overall >= 6.5
+      ? `${session.candidateName} performed well across the key areas for the ${session.role} role. There is clear potential and enough evidence to move forward with confidence.`
+      : overall >= 5
+        ? `${session.candidateName} showed capability in places but the overall picture was mixed. A follow-up technical screen or second interviewer would help clarify fit for the ${session.role} role.`
+        : `${session.candidateName} did not demonstrate the level of capability needed for the ${session.role} role at this time. Key areas fell below the expected standard.`;
 
   return {
     candidate_name:        session.candidateName,
@@ -227,18 +269,13 @@ export function generateReport(session) {
     communication_score:   stats.communication.count       > 0 ? commScore  : null,
     problem_solving_score: stats.problemSolving.count      > 0 ? solveScore : null,
     experience_score:      stats.practicalExperience.count > 0 ? expScore   : null,
-    strengths:             strengths.length  ? strengths  : ["No clear strengths identified"],
-    weaknesses:            weaknesses.length ? weaknesses : ["No clear weaknesses identified"],
-    recommended_hire:      overall >= 6,
-    hiring_decision:       overall >= 7.5 ? "STRONG_YES" : overall >= 6 ? "YES" : overall >= 4.5 ? "MAYBE" : "NO",
+    strengths:             strengths.length  ? strengths  : ["Insufficient data to identify clear strengths — consider a follow-up screen"],
+    weaknesses:            weaknesses.length ? weaknesses : ["No significant weaknesses identified in the areas assessed"],
+    recommended_hire:      overall >= 6.5,
+    hiring_decision:       hiringDecision,
+    hiring_recommendation: hiringLabel[hiringDecision],
     questions_asked:       session.questionsAsked.length,
-    summary: overall >= 7.5
-      ? `${session.candidateName} demonstrated strong skills across the board for the ${session.role} role. Recommend proceeding to next round.`
-      : overall >= 6
-        ? `${session.candidateName} showed solid potential. Consider moving forward for further evaluation.`
-        : overall >= 4.5
-          ? `${session.candidateName} showed some potential but has areas for improvement. Consider a follow-up interview.`
-          : `${session.candidateName} did not meet the threshold for the ${session.role} role at this time.`,
+    summary,
     transcript:       session.history,
     timestamp:        new Date().toISOString(),
     duration_minutes: Math.round((Date.now() - session.startTime) / 60000),

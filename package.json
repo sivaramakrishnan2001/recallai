@@ -24,9 +24,12 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@google-apps/meet": "^0.7.1",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "cors": "^2.8.6",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
+    "google-auth-library": "^10.6.2",
     "ws": "^8.20.0"
   },
   "devDependencies": {
