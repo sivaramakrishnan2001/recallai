@@ -113,9 +113,9 @@ export async function scheduleInterviewBot(config) {
 
     // Use high-quality web variant for all platforms
     variant: {
-      microsoft_teams: "web_4_core",
-      zoom:            "web_4_core",
-      google_meet:     "web_4_core",
+      microsoft_teams: "web_4_core"
+      // zoom:            "web_4_core",
+      // google_meet:     "web_4_core",
     },
 
     // Enable real-time streaming transcription (low latency)
