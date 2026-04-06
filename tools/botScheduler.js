@@ -88,8 +88,28 @@ export async function scheduleInterviewBot(config) {
   });
   const meetingPageUrl = `${ngrok_url}/meeting-page?${params}`;
 
-  // Map BCP-47 language tag (e.g. "hi-IN", "ja-JP") to Recall.ai language code (e.g. "hi", "ja")
-  const recallLangCode = language.split("-")[0];
+  // Map BCP-47 language tag to Recall.ai's recallai_streaming language code.
+  //
+  // Recall.ai streaming transcription only supports a subset of languages.
+  // Unsupported codes (ta, te, kn, ml, bn, ur, gu, pa, mr, th, ms, he, el,
+  // ro, hu, cs) cause a 400 error. We fall back to "en" for those — the
+  // AI conversation itself (OpenAI Realtime + ElevenLabs TTS) still runs
+  // in the requested language because it operates independently via the
+  // primary WebSocket audio path, not through Recall.ai's transcription.
+  const RECALL_STREAMING_SUPPORTED = new Set([
+    "en", "es", "fr", "de", "it", "pt", "zh", "ja",
+    "ko", "hi", "ar", "ru", "nl", "pl", "tr", "vi",
+    "id", "sv", "da", "fi", "nb", "no", "uk",
+  ]);
+  const rawLangCode    = language.split("-")[0].toLowerCase();
+  const recallLangCode = RECALL_STREAMING_SUPPORTED.has(rawLangCode) ? rawLangCode : "en";
+  if (recallLangCode !== rawLangCode) {
+    console.warn(
+      `[BotScheduler] Recall.ai streaming does not support language "${rawLangCode}" — ` +
+      `falling back to "en" for Recall.ai transcription. ` +
+      `OpenAI Realtime + ElevenLabs will still operate in ${language}.`
+    );
+  }
 
   // Truncate bot_name to Recall.ai's 100-character limit
   const rawBotName = `AI Interview: ${candidate_name}`;
