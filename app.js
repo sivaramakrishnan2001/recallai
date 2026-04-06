@@ -22,6 +22,7 @@ import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
+import { createHash } from "crypto";
 
 import {
   createSession,
@@ -214,9 +215,10 @@ wss.on("connection", (ws, req) => {
             // Whisper transcription of candidate's speech
             onTranscript: (text) => {
               if (!text?.trim()) return;
-              // Dedup: skip if this text closely matches the last user entry
+              // Fix 11: Normalised dedup — catches near-duplicates (punctuation/case variations)
+              const normalize = s => s.toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ").trim();
               const lastUser = session.history.filter(h => h.role === "user").pop();
-              if (lastUser && lastUser.content === text.trim()) return;
+              if (lastUser && normalize(lastUser.content) === normalize(text)) return;
               console.log(`[Transcript] "${text.substring(0, 80)}..."`);
               session.history.push({ role: "user", content: text.trim(), phase: session.phase });
               wsSend(ws, { type: "transcript", text: text.trim(), partial: false });
@@ -253,12 +255,20 @@ wss.on("connection", (ws, req) => {
                 item: {
                   type: "message",
                   role: entry.role,
-                  content: [{ type: "input_text", text: entry.content }],
+                  // Fix 2: assistant items must use type "text", not "input_text"
+                  content: entry.role === "assistant"
+                    ? [{ type: "text", text: entry.content }]
+                    : [{ type: "input_text", text: entry.content }],
                 },
               });
             }
-            // Continue the interview
-            realtimeSession.triggerResponse("Continue the interview from where we left off. Ask the next question.");
+            if (msg.isReconnect) {
+              // Fix 12: true client-side reconnect — history replayed, wait for candidate to speak
+              console.log(`[WS] Reconnect: history replayed for ${sessionId} — awaiting candidate`);
+            } else {
+              // First load but session already existed (e.g. bot restart) — AI continues
+              realtimeSession.triggerResponse("Continue the interview from where we left off. Ask the next question.");
+            }
           } else {
             // Fresh interview — send greeting
             const greetingPrompt = buildGreetingPrompt(session);
@@ -802,6 +812,9 @@ app.get("/meeting-page", (req, res) => {
   const difficulty = req.query.difficulty  || "medium";
   const type       = req.query.type       || "mixed";
   const sessionId  = req.query.sessionId || "";
+  const session    = sessionId ? getSession(sessionId) : null;
+  const resumeText = session?.resume || req.query.resume || "";
+  const maxDurationMinutes = session?.maxDurationMs ? Math.round(session.maxDurationMs / 60000) : 30;
   const proto      = req.get("x-forwarded-proto") || req.protocol || "https";
   const wsProto    = proto === "https" ? "wss" : "ws";
   const serverUrl  = `${proto}://${serverHost}`;
@@ -892,6 +905,8 @@ body{
 .done-icon svg{width:36px;height:36px;color:#fff}
 .done-card h2{font-size:22px;font-weight:700;margin-bottom:8px;color:var(--text)}
 .done-card p{font-size:14px;color:var(--text-dim);line-height:1.6}
+.ai-text{font-size:13px;color:var(--text-dim);text-align:center;margin:0 auto 8px;min-height:40px;line-height:1.55;max-width:380px;opacity:0;transition:opacity .35s;word-break:break-word}
+.ai-text.visible{opacity:1}
 </style>
 </head>
 <body>
@@ -919,6 +934,7 @@ body{
     <div class="wbar"></div><div class="wbar"></div><div class="wbar"></div><div class="wbar"></div><div class="wbar"></div>
   </div>
   <div class="status-label" id="statusLabel">Connecting...</div>
+  <div class="ai-text" id="aiText"></div>
   <div class="status-sub" id="statusSub">${esc(candidate)} &middot; ${esc(role)}</div>
   <div class="mic-bar" id="micBar">
     <div class="mic-dot"></div>
@@ -945,6 +961,8 @@ body{
     candidate:     '${esc(candidate)}',
     difficulty:    '${esc(difficulty)}',
     interviewType: '${esc(type)}',
+    resume:        '${esc(resumeText)}',
+    maxDuration:   ${maxDurationMinutes},
   };
 
   var PHASE_NAMES  = ['introduction','resume','technical','behavioral','closing','done'];
@@ -956,6 +974,8 @@ body{
   var audioQueue = [], currentAudio = null;
   var pendingDone = false;         // Bug 7: set true when done_pending arrives
   var pendingDoneReport = null;    // holds report until audio queue drains
+  var clearAudioTimer = null;      // Fix 10: debounce clear_audio between TTS segments
+  var sessionEstablished = false;  // Fix 12: true after first successful ready event
   var startTime = null;
   var currentPhase = 'introduction';
   var audioContext = null, micStream = null, timerInterval = null;
@@ -965,6 +985,7 @@ body{
   var $wave     = document.getElementById('waveform');
   var $label    = document.getElementById('statusLabel');
   var $sub      = document.getElementById('statusSub');
+  var $aiText   = document.getElementById('aiText');
   var $timer    = document.getElementById('timer');
   var $phaseTag = document.getElementById('phaseTag');
   var $micBar   = document.getElementById('micBar');
@@ -996,7 +1017,10 @@ body{
     var s = Math.floor((Date.now() - startTime) / 1000);
     var m = Math.floor(s / 60); s = s % 60;
     $timer.textContent = (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
-    $timer.className = 'timer' + (m >= 25 ? ' expired' : m >= 20 ? ' warning' : '');
+    // Fix 5: dynamic warning thresholds based on actual session maxDuration
+    var warnAt   = Math.max(5, CFG.maxDuration - 8);
+    var expireAt = Math.max(warnAt + 1, CFG.maxDuration - 2);
+    $timer.className = 'timer' + (m >= expireAt ? ' expired' : m >= warnAt ? ' warning' : '');
   }
 
   function escHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
@@ -1009,6 +1033,8 @@ body{
   // ── Audio Playback Queue ───────────────────────────────
   function enqueueAudio(b64) {
     if (!b64) { if (!audioQueue.length) playing = false; return; }
+    // Fix 10: cancel pending clear_audio — new audio chunk arrived before debounce fired
+    if (clearAudioTimer) { clearTimeout(clearAudioTimer); clearAudioTimer = null; }
     audioQueue.push(b64);
     if (!playing) playNext();
   }
@@ -1022,16 +1048,29 @@ body{
       currentAudio.pause();
       currentAudio = null;
     }
+    if (clearAudioTimer) { clearTimeout(clearAudioTimer); clearAudioTimer = null; }
     audioQueue = [];
     playing = false;
+  }
+
+  // Fix 10: debounced clear_audio — only fires if no new TTS chunk arrives within 600ms.
+  // Prevents flushing candidate speech in the gap between ElevenLabs audio segments.
+  function scheduleClearAudio() {
+    if (clearAudioTimer) clearTimeout(clearAudioTimer);
+    clearAudioTimer = setTimeout(function() {
+      clearAudioTimer = null;
+      if (!playing && audioQueue.length === 0 && ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'clear_audio' }));
+      }
+    }, 600);
   }
 
   function playNext() {
     if (audioQueue.length === 0) {
       playing = false;
       currentAudio = null;
-      // TTS finished naturally — flush any residual echo from OpenAI's audio buffer
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'clear_audio' }));
+      // TTS finished naturally — schedule debounced echo flush
+      scheduleClearAudio();
       // Bug 7 fix: show done overlay only after the last TTS chunk finishes playing
       if (pendingDone) {
         pendingDone = false;
@@ -1058,7 +1097,7 @@ body{
     });
   }
 
-  // ── Audio Capture (getUserMedia -> PCM16 24kHz) ────────
+  // ── Audio Capture (getUserMedia → PCM16 24kHz via AudioWorklet) ──────────
   async function startAudioCapture() {
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -1073,44 +1112,100 @@ body{
       });
 
       audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+
+      // Fix 8: browsers suspend AudioContext until user gesture — resume explicitly
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+
       var source = audioContext.createMediaStreamSource(micStream);
 
-      // Use ScriptProcessorNode (widely supported) for PCM16 capture
-      var processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processor.onaudioprocess = function(e) {
+      // Fix 4+9: AudioWorkletProcessor replaces deprecated ScriptProcessorNode.
+      // Runs off the main thread → lower latency, no deprecation warnings.
+      // Loaded via inline Blob URL so no separate file is needed.
+      var workletSrc = [
+        'class PCM16Processor extends AudioWorkletProcessor {',
+        '  process(inputs) {',
+        '    var ch = inputs[0] && inputs[0][0];',
+        '    if (ch && ch.length) this.port.postMessage(ch.slice());',
+        '    return true;',
+        '  }',
+        '}',
+        "registerProcessor('pcm16-processor', PCM16Processor);"
+      ].join('\n');
+      var workletBlob = new Blob([workletSrc], { type: 'application/javascript' });
+      var workletUrl  = URL.createObjectURL(workletBlob);
+      await audioContext.audioWorklet.addModule(workletUrl);
+      URL.revokeObjectURL(workletUrl);
+
+      var workletNode = new AudioWorkletNode(audioContext, 'pcm16-processor');
+      workletNode.port.onmessage = function(e) {
         if (interviewDone || !ws || ws.readyState !== 1) return;
+        var float32 = e.data;
 
-        var inputData = e.inputBuffer.getChannelData(0);
-
-        // Convert Float32 to Int16 (PCM16)
-        var pcm16 = new Int16Array(inputData.length);
-        for (var i = 0; i < inputData.length; i++) {
-          var s = Math.max(-1, Math.min(1, inputData[i]));
+        // Convert Float32 → Int16 (PCM16)
+        var pcm16 = new Int16Array(float32.length);
+        for (var i = 0; i < float32.length; i++) {
+          var s = Math.max(-1, Math.min(1, float32[i]));
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
 
-        // Base64 encode
+        // Base64 encode and send
         var bytes = new Uint8Array(pcm16.buffer);
         var binary = '';
-        for (var j = 0; j < bytes.length; j++) {
-          binary += String.fromCharCode(bytes[j]);
-        }
-        var b64 = btoa(binary);
-
-        // Send to server
-        ws.send(JSON.stringify({ type: 'audio', data: b64 }));
+        for (var j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+        ws.send(JSON.stringify({ type: 'audio', data: btoa(binary) }));
       };
 
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+      // Fix 4: source → workletNode only. NOT connected to destination —
+      // avoids playing captured mic audio back through the speakers.
+      source.connect(workletNode);
 
       setMic('Microphone active', true);
-      console.log('[Audio] Capture started (24kHz PCM16)');
+      console.log('[Audio] Capture started (24kHz PCM16, AudioWorklet)');
       return true;
+
     } catch (err) {
-      console.warn('[Audio] getUserMedia failed:', err.message);
-      setMic('Microphone unavailable - use text input', false);
-      return false;
+      // Fallback: AudioWorklet not supported (older browsers) — use ScriptProcessorNode
+      console.warn('[Audio] AudioWorklet failed, trying ScriptProcessorNode:', err.message);
+      try {
+        if (!micStream) {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, sampleRate: 24000, echoCancellation: true,
+                     noiseSuppression: true, autoGainControl: true },
+            video: false,
+          });
+        }
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        }
+        if (audioContext.state === 'suspended') await audioContext.resume();
+
+        var source2   = audioContext.createMediaStreamSource(micStream);
+        var processor = audioContext.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = function(e) {
+          if (interviewDone || !ws || ws.readyState !== 1) return;
+          var inputData = e.inputBuffer.getChannelData(0);
+          var pcm16 = new Int16Array(inputData.length);
+          for (var i = 0; i < inputData.length; i++) {
+            var s = Math.max(-1, Math.min(1, inputData[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          var bytes = new Uint8Array(pcm16.buffer);
+          var binary = '';
+          for (var j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+          ws.send(JSON.stringify({ type: 'audio', data: btoa(binary) }));
+        };
+        // Fix 4: deliberately NOT connecting to destination — no mic feedback loop
+        source2.connect(processor);
+        setMic('Microphone active', true);
+        console.log('[Audio] Fallback ScriptProcessorNode active');
+        return true;
+      } catch (fallbackErr) {
+        console.warn('[Audio] All capture methods failed:', fallbackErr.message);
+        setMic('Microphone unavailable', false);
+        return false;
+      }
     }
   }
 
@@ -1122,14 +1217,17 @@ body{
 
     ws.onopen = function() {
       console.log('[WS] Connected');
-      // Initialize session
+      // Fix 12: on reconnect send isReconnect=true so server replays history
+      // without triggering a new greeting or AI response
       ws.send(JSON.stringify({
         type: 'init',
-        sessionId: CFG.sessionId,
-        candidate: CFG.candidate,
-        role: CFG.role,
-        difficulty: CFG.difficulty,
+        sessionId:     CFG.sessionId,
+        candidate:     CFG.candidate,
+        role:          CFG.role,
+        difficulty:    CFG.difficulty,
         interviewType: CFG.interviewType,
+        resume:        CFG.resume,
+        isReconnect:   sessionEstablished,
       }));
     };
 
@@ -1139,17 +1237,21 @@ body{
 
       switch (msg.type) {
         case 'ready':
+          sessionEstablished = true;  // Fix 12: mark established for reconnect detection
           if (!startTime) startTime = Date.now();
           if (!timerInterval) timerInterval = setInterval(updateTimer, 1000);
           setMode('processing', 'Starting interview...', 'AI is preparing');
-          // Start audio capture
           startAudioCapture();
           break;
 
         case 'text':
-          // Bug 3 fix: text + phase pushed separately from audio so UI always updates
+          // Fix 6: AI response text goes to dedicated $aiText element, not $sub
+          // $sub is reserved for candidate transcript only
           if (msg.phase) updatePhase(msg.phase);
-          if (msg.text)  $sub.textContent = msg.text;
+          if (msg.text) {
+            $aiText.textContent = msg.text;
+            $aiText.classList.add('visible');
+          }
           break;
 
         case 'audio':
@@ -1169,7 +1271,14 @@ body{
           break;
 
         case 'text_delta':
-          // Live text streaming (optional visual feedback)
+          // Fix 7: stream AI text deltas into $aiText for live preview
+          if (msg.delta) {
+            if (!$aiText.classList.contains('visible')) {
+              $aiText.textContent = '';  // clear stale text before streaming new response
+              $aiText.classList.add('visible');
+            }
+            $aiText.textContent += msg.delta;
+          }
           break;
 
         case 'phase':
@@ -1178,6 +1287,9 @@ body{
 
         case 'speech_start':
           setMic('Speaking detected...', true);
+          // Fix 6: clear AI text when candidate begins speaking — it's no longer current
+          $aiText.textContent = '';
+          $aiText.classList.remove('visible');
           // Barge-in: user started speaking while bot TTS is playing — stop immediately.
           // Do NOT send clear_audio here — OpenAI's VAD already has the user's speech
           // buffered and sending clear_audio would erase it.
